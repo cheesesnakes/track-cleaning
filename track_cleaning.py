@@ -11,11 +11,13 @@ wrapped in a Qt-based viewer with zoom/pan for fine-grained ID.
 Features:
   • CLI args (-c/-l/-f) with Qt file/folder dialogs as fallback for any
     input not supplied on the command line.
+  • Loads a TaxonomicMultiHead checkpoint (produced by train.py or by a
+    previous session) and refines it in place. Predictions from frame one.
   • Label one representative frame per track; the label is propagated to
     every unlabeled row sharing that Track ID.
-  • Auto-suggestion from the current multi-head model (species / genus /
-    family) with softmax confidences shown in the UI. Press Enter on an
-    empty field to accept, type a name to override.
+  • Auto-suggestion from the current multi-head model with softmax
+    confidences shown in the UI. Press Enter on an empty field to accept,
+    type a name to override.
   • Zoomable, pannable viewer (scroll wheel to zoom under cursor, drag to
     pan, double-click to toggle fit ↔ 100%, Ctrl+0 / Ctrl+1 / Ctrl+= /
     Ctrl+- shortcuts) for resolving ambiguous fish.
@@ -24,7 +26,8 @@ Features:
   • Every RETRAIN_INTERVAL confirmations, and once more at session end,
     the model is retrained on the on-disk crop corpus. Training runs on a
     QThread worker so the UI stays responsive and streams epoch/loss
-    progress to the status bar.
+    progress to the status bar. Label-map indices are preserved across
+    retrains, so trained head rows are never silently reassigned.
   • Labeled CSV is flushed at every milestone and on exit, preserving the
     input's subfolder structure under ./output/tracks/.
 
@@ -52,7 +55,6 @@ Requires:
 
 import argparse
 import os
-import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -90,14 +92,15 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 from model import TaxonomicMultiHead
-from taxonomy import TaxonomyResolver
+from taxonomy import TaxonomyResolver, canonical_species
 
 # ==========================================
 # Configuration
 # ==========================================
 OUTPUT_CROP_DIR = "./output/labeled_fish_crops"
-CHECKPOINT_DIR = "./models"
+CHECKPOINT_DIR = "./models/checkpoints"
 MULTIHEAD_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "fish-classifier-1.pth")
+BACKBONE_PATH = "./models/fish-classifier-0.pth"
 CSV_OUT = "./output/tracks"
 
 RETRAIN_INTERVAL = 150
@@ -138,7 +141,7 @@ def get_output_csv_path(input_csv_path, output_base_dir):
 
     Example:
       Input:  /data/projects/annotated_videos/site_1/cam_A/labels.csv
-      Output: ./output/videos/site_1/cam_A/labels.csv
+      Output: ./output/tracks/site_1/cam_A/labels.csv
     """
     abs_input = Path(input_csv_path).resolve()
     parts = abs_input.parts
@@ -239,12 +242,6 @@ def get_user_paths(csv_path=None, checklist_path=None, root_data_dir=None):
 # ==========================================
 # 2. Helpers
 # ==========================================
-def clean_label_string(text):
-    if not isinstance(text, str):
-        return ""
-    return re.sub(r"[^a-zA-Z0-9_]", "", text.strip().replace(" ", "_").lower())
-
-
 def build_frame_index(root_dir):
     index = {}
     for dirpath, _, filenames in os.walk(root_dir):
@@ -284,8 +281,7 @@ class FishCropDataset(Dataset):
         for species_dir in sorted(root.iterdir()):
             if not species_dir.is_dir():
                 continue
-            species_raw = species_dir.name
-            sp_key, genus, family = resolver.resolve(species_raw)
+            sp_key, genus, family = resolver.resolve(species_dir.name)
             if (
                 sp_key not in sp_to_idx
                 or genus not in gn_to_idx
@@ -308,23 +304,46 @@ class FishCropDataset(Dataset):
         return transformed_img, sp, gn, fa
 
 
-def build_label_maps(crop_dir, resolver):
-    species_set, genus_set, family_set = set(), set(), set()
+def build_label_maps(crop_dir, resolver, prev_sp=None, prev_gn=None, prev_fa=None):
+    """
+    Scan `crop_dir` and produce the three label maps.
+
+    If previous maps are supplied, ALL previously-known classes keep their
+    indices (even those with no crops on disk right now), and new classes
+    found in `crop_dir` are appended alphabetically.  This is critical: a
+    naive re-sort would reassign species → index between retrains, silently
+    pointing the head weights at the wrong species.
+    """
+    sp_set, gn_set, fa_set = set(), set(), set()
     root = Path(crop_dir)
-    if not root.exists():
-        return {}, {}, {}
+    if root.exists():
+        for species_dir in sorted(root.iterdir()):
+            if not species_dir.is_dir():
+                continue
+            sp_key, genus, family = resolver.resolve(species_dir.name)
+            if not sp_key:
+                continue
+            sp_set.add(sp_key)
+            gn_set.add(genus)
+            fa_set.add(family)
 
-    for species_dir in sorted(root.iterdir()):
-        if not species_dir.is_dir():
-            continue
-        sp_key, genus, family = resolver.resolve(species_dir.name)
-        species_set.add(sp_key)
-        genus_set.add(genus)
-        family_set.add(family)
+    def stable(existing, keys):
+        existing = existing or {}
+        out = {}
+        # Preserve every previously-known class at its old index.
+        for k, i in sorted(existing.items(), key=lambda kv: kv[1]):
+            out[k] = i
+        next_idx = (max(out.values()) + 1) if out else 0
+        # Append new keys alphabetically after the highest existing index.
+        for k in sorted(keys):
+            if k not in out:
+                out[k] = next_idx
+                next_idx += 1
+        return out
 
-    sp_to_idx = {s: i for i, s in enumerate(sorted(species_set))}
-    gn_to_idx = {g: i for i, g in enumerate(sorted(genus_set))}
-    fa_to_idx = {f: i for i, f in enumerate(sorted(family_set))}
+    sp_to_idx = stable(prev_sp, sp_set)
+    gn_to_idx = stable(prev_gn, gn_set)
+    fa_to_idx = stable(prev_fa, fa_set)
     return sp_to_idx, gn_to_idx, fa_to_idx
 
 
@@ -342,12 +361,29 @@ def compute_class_weights(labels, num_classes):
 # ==========================================
 # 4. Retraining  (runs on a worker thread)
 # ==========================================
-def retrain(model, resolver, epochs=EPOCHS_PER_RETRAIN, log=print):
+def retrain(
+    model,
+    resolver,
+    epochs=EPOCHS_PER_RETRAIN,
+    log=print,
+    prev_sp=None,
+    prev_gn=None,
+    prev_fa=None,
+):
     """
     Full retrain pass.  `log` is a callable that receives status strings so
     the caller (Qt worker) can route them into the UI instead of stdout.
+
+    `prev_*` maps, if given, are used to preserve class indices across
+    retrains so a growing label set never reshuffles the head weights.
     """
-    sp_to_idx, gn_to_idx, fa_to_idx = build_label_maps(OUTPUT_CROP_DIR, resolver)
+    sp_to_idx, gn_to_idx, fa_to_idx = build_label_maps(
+        OUTPUT_CROP_DIR,
+        resolver,
+        prev_sp=prev_sp,
+        prev_gn=prev_gn,
+        prev_fa=prev_fa,
+    )
     n_sp, n_gn, n_fa = len(sp_to_idx), len(gn_to_idx), len(fa_to_idx)
 
     if min(n_sp, n_gn, n_fa) < 2:
@@ -431,27 +467,99 @@ def save_checkpoint(model, sp_to_idx, gn_to_idx, fa_to_idx):
     print(f" 💾 Checkpoint saved to {MULTIHEAD_CHECKPOINT}")
 
 
+# ==========================================
+# 4b. Robust checkpoint loading
+# ==========================================
+def _infer_head_sizes_from_state_dict(state_dict):
+    """
+    Recover (num_species, num_genera, num_families) from a checkpoint whose
+    explicit size keys are missing (older save format).  Looks for any
+    state_dict key ending in a head-weight suffix and reads dim 0.
+    """
+
+    def _find(suffixes):
+        for k, v in state_dict.items():
+            for suf in suffixes:
+                if k.endswith(suf) and hasattr(v, "shape") and v.dim() == 2:
+                    return int(v.shape[0])
+        return None
+
+    n_sp = _find(("fc_species.weight", "species_head.weight", "sp_head.weight"))
+    n_gn = _find(("fc_genus.weight", "genus_head.weight", "gn_head.weight"))
+    n_fa = _find(("fc_family.weight", "family_head.weight", "fa_head.weight"))
+    return n_sp, n_gn, n_fa
+
+
 def build_or_load_model(backbone_path=None):
     if os.path.exists(MULTIHEAD_CHECKPOINT):
         ckpt = torch.load(MULTIHEAD_CHECKPOINT, map_location=DEVICE)
+        state = ckpt["model_state"]
+
+        n_sp = ckpt.get("num_species")
+        n_gn = ckpt.get("num_genera")
+        n_fa = ckpt.get("num_families")
+
+        sp_to_idx = ckpt.get("sp_to_idx") or {}
+        gn_to_idx = ckpt.get("gn_to_idx") or {}
+        fa_to_idx = ckpt.get("fa_to_idx") or {}
+
+        # Fallback chain: explicit keys → label-map lengths → head shapes.
+        if n_sp is None and sp_to_idx:
+            n_sp = len(sp_to_idx)
+        if n_gn is None and gn_to_idx:
+            n_gn = len(gn_to_idx)
+        if n_fa is None and fa_to_idx:
+            n_fa = len(fa_to_idx)
+
+        if None in (n_sp, n_gn, n_fa):
+            i_sp, i_gn, i_fa = _infer_head_sizes_from_state_dict(state)
+            n_sp = n_sp or i_sp
+            n_gn = n_gn or i_gn
+            n_fa = n_fa or i_fa
+
+        if None in (n_sp, n_gn, n_fa):
+            raise RuntimeError(
+                f"Could not determine head sizes from {MULTIHEAD_CHECKPOINT}. "
+                f"Top-level keys: {sorted(ckpt.keys())}; "
+                f"first state_dict keys: {list(state.keys())[:8]}"
+            )
+
         model = TaxonomicMultiHead(
             backbone_path=None,
-            num_species=ckpt["num_species"],
-            num_genera=ckpt["num_genera"],
-            num_families=ckpt["num_families"],
+            num_species=n_sp,
+            num_genera=n_gn,
+            num_families=n_fa,
         ).to(DEVICE)
-        model.load_state_dict(ckpt["model_state"])
+        model.load_state_dict(state)
         model.eval()
         print(
             f" ➔ Loaded checkpoint {MULTIHEAD_CHECKPOINT} "
-            f"(sp={ckpt['num_species']}, gn={ckpt['num_genera']}, fa={ckpt['num_families']})"
+            f"(sp={n_sp}, gn={n_gn}, fa={n_fa})"
         )
-        return model, ckpt["sp_to_idx"], ckpt["gn_to_idx"], ckpt["fa_to_idx"], True
+        return model, sp_to_idx, gn_to_idx, fa_to_idx, True
 
-    model = TaxonomicMultiHead(
-        backbone_path=backbone_path, num_species=2, num_genera=2, num_families=2
-    ).to(DEVICE)
-    print(" ➔ Initialized cold/warm multi-head model.")
+    if backbone_path and os.path.exists(backbone_path):
+        print(f" ➔ Using pretrained backbone {backbone_path}")
+        model = TaxonomicMultiHead(
+            backbone_path=backbone_path,
+            num_species=2,
+            num_genera=2,
+            num_families=2,
+        ).to(DEVICE)
+    else:
+        if backbone_path:
+            print(
+                f" ⚠ Backbone {backbone_path} not found — "
+                f"starting without ImageNet-pretrained fish features."
+            )
+        model = TaxonomicMultiHead(
+            backbone_path=None,
+            num_species=2,
+            num_genera=2,
+            num_families=2,
+        ).to(DEVICE)
+        print(" ➔ Initialized cold multi-head model.")
+
     return model, {}, {}, {}, False
 
 
@@ -493,14 +601,24 @@ class RetrainWorker(QThread):
     progress = Signal(str)
     finished_with_result = Signal(object, object, object)
 
-    def __init__(self, model, resolver):
+    def __init__(self, model, resolver, prev_sp=None, prev_gn=None, prev_fa=None):
         super().__init__()
         self.model = model
         self.resolver = resolver
+        self.prev_sp = prev_sp or {}
+        self.prev_gn = prev_gn or {}
+        self.prev_fa = prev_fa or {}
 
     def run(self):
         try:
-            result = retrain(self.model, self.resolver, log=self.progress.emit)
+            result = retrain(
+                self.model,
+                self.resolver,
+                log=self.progress.emit,
+                prev_sp=self.prev_sp,
+                prev_gn=self.prev_gn,
+                prev_fa=self.prev_fa,
+            )
         except Exception as exc:  # noqa: BLE001 - surface anything to the UI
             self.progress.emit(f"❌ Retrain failed: {exc}")
             result = (None, None, None)
@@ -532,7 +650,6 @@ class ZoomableImageView(QGraphicsView):
         self._scene.addItem(self._pixmap_item)
 
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
-        # We do all anchoring manually so the resize handler doesn't fight us.
         self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setResizeAnchor(QGraphicsView.NoAnchor)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
@@ -604,7 +721,6 @@ class ZoomableImageView(QGraphicsView):
         event.accept()
 
     def mouseDoubleClickEvent(self, event):  # noqa: N802 - Qt API
-        # Toggle between fit-to-window and 1:1
         if abs(self._current_scale - 1.0) < 1e-3:
             self.fit_to_view()
         else:
@@ -661,7 +777,6 @@ class LabelerWindow(QMainWindow):
         self._closing = False
 
         self._build_ui()
-        # kick off the first item on the next event-loop tick
         QTimer.singleShot(0, self._advance)
 
     # ---------- UI construction ----------
@@ -703,9 +818,7 @@ class LabelerWindow(QMainWindow):
             "Ready. Type a species name, leave blank to accept, 'exit' to finish."
         )
 
-        # Convenience shortcut: Ctrl+Q quits through the same finalize path.
         QShortcut(QKeySequence("Ctrl+Q"), self, activated=self.close)
-        # Zoom / pan shortcuts. Ctrl-prefixed so they don't fight the entry field.
         QShortcut(QKeySequence("Ctrl+="), self, activated=self.image_view.zoom_in)
         QShortcut(QKeySequence("Ctrl++"), self, activated=self.image_view.zoom_in)
         QShortcut(QKeySequence("Ctrl+-"), self, activated=self.image_view.zoom_out)
@@ -719,18 +832,6 @@ class LabelerWindow(QMainWindow):
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
         self._current_pixmap = QPixmap.fromImage(qimg)
         self.image_view.set_pixmap(self._current_pixmap)
-
-    def _rescale_pixmap(self):
-        if self._current_pixmap is None:
-            return
-        scaled = self._current_pixmap.scaled(
-            self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self.image_label.setPixmap(scaled)
-
-    def resizeEvent(self, event):  # noqa: N802 - Qt API
-        super().resizeEvent(event)
-        self._rescale_pixmap()
 
     # ---------- navigation ----------
     def _find_next_unlabeled(self, start):
@@ -773,7 +874,6 @@ class LabelerWindow(QMainWindow):
         self.current_row = row
         self.current_cropped = cropped
 
-        # Inference (safe: retrain worker is never alive here)
         suggestion, source_type = None, ""
         model_genus = model_family = None
         if self.is_trained:
@@ -783,7 +883,7 @@ class LabelerWindow(QMainWindow):
             sp, gn, fa, c_sp, c_gn, c_fa = predict(
                 self.model, tensor, self.sp_inv, self.gn_inv, self.fa_inv
             )
-            suggestion = clean_label_string(sp)
+            suggestion = canonical_species(sp)
             model_genus = gn
             model_family = fa
             source_type = (
@@ -825,7 +925,6 @@ class LabelerWindow(QMainWindow):
         self.submit_btn.setEnabled(enabled)
 
     def _on_submit(self):
-        # Ignore input while a retrain worker owns the model or during shutdown.
         if self._closing or (self.retrain_worker and self.retrain_worker.isRunning()):
             return
         if self.current_idx < 0 or self.current_row is None:
@@ -838,9 +937,9 @@ class LabelerWindow(QMainWindow):
             return
 
         if text == "" and self.current_suggestion:
-            final_species = clean_label_string(self.current_suggestion)
+            final_species = canonical_species(self.current_suggestion)
         elif text != "":
-            final_species = clean_label_string(text)
+            final_species = canonical_species(text)
         else:
             self.reco_label.setText(
                 "❌ Input required — no valid recommendation exists yet."
@@ -848,7 +947,8 @@ class LabelerWindow(QMainWindow):
             return
 
         row = self.current_row
-        _, final_genus, final_family = self.resolver.resolve(final_species)
+        # resolver normalizes both sides and returns the canonical key.
+        final_species, final_genus, final_family = self.resolver.resolve(final_species)
 
         if final_family == "Unknown_Family" and self.current_model_family:
             final_family = self.current_model_family
@@ -885,10 +985,15 @@ class LabelerWindow(QMainWindow):
         self.statusBar().showMessage(
             f"🔄 Milestone ({self.action_counter} actions). Retraining…"
         )
-        # Flush current progress before the worker starts
         self.df.to_csv(self.out_csv_path, index=False)
 
-        self.retrain_worker = RetrainWorker(self.model, self.resolver)
+        self.retrain_worker = RetrainWorker(
+            self.model,
+            self.resolver,
+            prev_sp=self.sp_to_idx,
+            prev_gn=self.gn_to_idx,
+            prev_fa=self.fa_to_idx,
+        )
         self.retrain_worker.progress.connect(self._on_retrain_progress)
         self.retrain_worker.finished_with_result.connect(self._on_retrain_done)
         self.retrain_worker.start()
@@ -917,25 +1022,28 @@ class LabelerWindow(QMainWindow):
 
     # ---------- shutdown ----------
     def closeEvent(self, event):  # noqa: N802 - Qt API
-        # If we've already gone through finalize, just close.
         if self._closing:
             event.accept()
             return
 
-        # Nothing was labeled — no need for a final retrain.
         if self.action_counter == 0:
             self.df.to_csv(self.out_csv_path, index=False)
             event.accept()
             return
 
-        # Otherwise: ignore the event, run final retrain, then re-close.
         event.ignore()
         self._closing = True
         self._set_input_enabled(False)
         self.df.to_csv(self.out_csv_path, index=False)
 
         self.statusBar().showMessage("🏁 Session ending — running final retrain…")
-        self.retrain_worker = RetrainWorker(self.model, self.resolver)
+        self.retrain_worker = RetrainWorker(
+            self.model,
+            self.resolver,
+            prev_sp=self.sp_to_idx,
+            prev_gn=self.gn_to_idx,
+            prev_fa=self.fa_to_idx,
+        )
         self.retrain_worker.progress.connect(self._on_retrain_progress)
         self.retrain_worker.finished_with_result.connect(self._on_final_retrain_done)
         self.retrain_worker.start()
@@ -949,16 +1057,15 @@ class LabelerWindow(QMainWindow):
         self.df.to_csv(self.out_csv_path, index=False)
         print(f"🏁 Session closed. Progress saved to: {self.out_csv_path}")
         self.retrain_worker = None
-        self.close()  # _closing is True → accepted immediately
+        self.close()
 
 
 # ==========================================
-# 7. Entry point
+# 8. Entry point
 # ==========================================
 def execute_pipeline():
     args = parse_args()
 
-    # QApplication must exist before any QFileDialog / QMainWindow is created.
     app = QApplication.instance() or QApplication(sys.argv)
 
     csv_path, checklist_path, root_data_dir = get_user_paths(
@@ -988,10 +1095,8 @@ def execute_pipeline():
         if col not in df.columns:
             df[col] = pd.Series([pd.NA] * len(df), dtype="object")
 
-    backbone_path = "/models/fish-classifier-0.pth"
-    backbone_arg = backbone_path if os.path.exists(backbone_path) else None
     model, sp_to_idx, gn_to_idx, fa_to_idx, is_trained = build_or_load_model(
-        backbone_arg
+        BACKBONE_PATH
     )
 
     print("\n=======================================================")

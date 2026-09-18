@@ -1,29 +1,59 @@
 """
 train.py
 
-Pretrain a ResNet18 backbone on reference imagery (GBIF / iNaturalist
-folders from download_images.py, or local copies of FishWIO / WildFish /
-Fish4Knowledge arranged as one folder per class).
+Pretrain a TaxonomicMultiHead model on reference imagery (GBIF /
+iNaturalist folders from download_images.py, or local copies of FishWIO /
+WildFish / Fish4Knowledge arranged as one folder per species).
 
-Only the convolutional weights from the output .pth are consumed by the
-multi-head model in model.py — the final `fc` layer is discarded at load
-time, so the exact class count here does not need to match downstream.
+Unlike the previous single-head version, this produces a checkpoint that is
+*directly loadable* by track_cleaning.py: the same state_dict format, the
+same label-map schema, and the same three-head architecture.  The active
+learning loop then refines those heads on user-confirmed crops.
+
+Species folder names are normalized via taxonomy.canonical_species, so
+'Lutjanus decussatus', 'Lutjanus_decussatus', and 'lutjanus_decussatus'
+all map to the same class.  Genus and family are derived from the checklist
+via TaxonomyResolver; species absent from the checklist still get a
+genus/family estimate (first-token genus, 'Unknown_Family' family) so the
+model can learn from regional out-of-checklist imagery.
 
 Usage:
-    python train.py --data-dir ./reference_images \
-        --epochs 15 --batch-size 32 --out pretrained_backbone.pth [--amp]
+    python train.py \
+        --data-dir ./reference_images \
+        --checklist andaman_checklist.csv \
+        --epochs 15 --batch-size 32 \
+        --out models/checkpoints/fish-classifier-1.pth \
+        [--amp]
 """
 
 import argparse
+import os
+from pathlib import Path
+
 import torch
-from torch import nn
-from torch import optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, models, transforms
+from PIL import Image
+from torch import nn, optim
+from torch.utils.data import DataLoader, Dataset, random_split
+from torchvision import transforms
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from taxonomy import TaxonomyResolver, canonical_species
 
-train_transform = transforms.Compose(
+try:
+    from model import TaxonomicMultiHead
+except ImportError as exc:
+    raise SystemExit(
+        f"Could not import TaxonomicMultiHead from model.py: {exc}\n"
+        f"Expected signature: __init__(backbone_path, num_species, "
+        f"num_genera, num_families), forward(x) -> (sp, gn, fa) logits."
+    ) from exc
+
+# Match track_cleaning.py's loss weights so the two stages optimize the same objective.
+LAMBDA_GENUS = 0.3
+LAMBDA_FAMILY = 0.1
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+TRAIN_TRANSFORM = transforms.Compose(
     [
         transforms.Resize((224, 224)),
         transforms.RandomHorizontalFlip(),
@@ -33,7 +63,7 @@ train_transform = transforms.Compose(
     ]
 )
 
-eval_transform = transforms.Compose(
+EVAL_TRANSFORM = transforms.Compose(
     [
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
@@ -41,28 +71,122 @@ eval_transform = transforms.Compose(
     ]
 )
 
-
-def build_model(num_classes):
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    return model.to(device)
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 
 
-def run_epoch(model, loader, criterion, optimizer=None, scaler=None, use_amp=False):
-    is_train = optimizer is not None
-    model.train() if is_train else model.eval()
+# ==========================================
+# Dataset: ImageFolder-lite with canonical labels
+# ==========================================
+def scan_reference_folders(root_dir, resolver):
+    """
+    Walk root_dir (one subfolder per species), normalize folder names via
+    canonical_species, and derive the three label maps.
 
-    total_loss, total_correct, total_seen = 0.0, 0, 0
-    with torch.set_grad_enabled(is_train):
-        for inputs, targets in loader:
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            if is_train:
+    Returns (samples, sp_to_idx, gn_to_idx, fa_to_idx) where samples is a
+    list of (img_path, sp_idx, gn_idx, fa_idx).
+    """
+    root = Path(root_dir)
+    if not root.is_dir():
+        raise SystemExit(f"Reference directory not found: {root}")
+
+    sp_set, gn_set, fa_set = set(), set(), set()
+    records = []  # (path, species_key, genus, family)
+    skipped_dirs = 0
+
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        sp_key, genus, family = resolver.resolve(d.name)
+        if not sp_key:
+            skipped_dirs += 1
+            continue
+        n_imgs = 0
+        for img in sorted(d.iterdir()):
+            if img.suffix.lower() in IMAGE_EXTS:
+                records.append((str(img), sp_key, genus, family))
+                n_imgs += 1
+        if n_imgs == 0:
+            skipped_dirs += 1
+            continue
+        sp_set.add(sp_key)
+        gn_set.add(genus)
+        fa_set.add(family)
+
+    if len(sp_set) < 2:
+        raise SystemExit(
+            f"Need ≥2 non-empty species folders under {root}; found {len(sp_set)}."
+        )
+    if skipped_dirs:
+        print(f" ⚠ Skipped {skipped_dirs} folder(s) with no images or empty names.")
+
+    sp_to_idx = {s: i for i, s in enumerate(sorted(sp_set))}
+    gn_to_idx = {g: i for i, g in enumerate(sorted(gn_set))}
+    fa_to_idx = {f: i for i, f in enumerate(sorted(fa_set))}
+
+    samples = [
+        (path, sp_to_idx[sp], gn_to_idx[gn], fa_to_idx[fa])
+        for path, sp, gn, fa in records
+    ]
+    return samples, sp_to_idx, gn_to_idx, fa_to_idx
+
+
+class MultiHeadFishDataset(Dataset):
+    def __init__(self, samples, transform):
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, sp, gn, fa = self.samples[idx]
+        with Image.open(path) as img:
+            rgb = img.convert("RGB")
+            tensor = self.transform(rgb)
+        return tensor, sp, gn, fa
+
+
+# ==========================================
+# Training
+# ==========================================
+def class_weights(labels, n_classes):
+    """Inverse-frequency weights, clamped, on DEVICE — matches track_cleaning."""
+    counts = torch.bincount(
+        torch.tensor(labels, dtype=torch.long), minlength=n_classes
+    ).float()
+    counts = torch.clamp(counts, min=1.0)
+    w = counts.sum() / (n_classes * counts)
+    return torch.clamp(w.to(DEVICE), max=10.0)
+
+
+def run_epoch(model, loader, optimizers_and_loss, scaler, train, use_amp):
+    optimizer, w_sp, w_gn, w_fa = optimizers_and_loss
+    model.train() if train else model.eval()
+
+    total_loss, total_seen = 0.0, 0
+    sp_correct = gn_correct = fa_correct = 0
+
+    with torch.set_grad_enabled(train):
+        for imgs, y_sp, y_gn, y_fa in loader:
+            imgs = imgs.to(DEVICE, non_blocking=True)
+            y_sp = y_sp.to(DEVICE)
+            y_gn = y_gn.to(DEVICE)
+            y_fa = y_fa.to(DEVICE)
+
+            if train:
                 optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-            if is_train:
+
+            with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
+                logits_sp, logits_gn, logits_fa = model(imgs)
+                loss = (
+                    nn.functional.cross_entropy(logits_sp, y_sp, weight=w_sp)
+                    + LAMBDA_GENUS
+                    * nn.functional.cross_entropy(logits_gn, y_gn, weight=w_gn)
+                    + LAMBDA_FAMILY
+                    * nn.functional.cross_entropy(logits_fa, y_fa, weight=w_fa)
+                )
+
+            if train:
                 if use_amp:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
@@ -71,89 +195,181 @@ def run_epoch(model, loader, criterion, optimizer=None, scaler=None, use_amp=Fal
                     loss.backward()
                     optimizer.step()
 
-            total_loss += loss.item() * inputs.size(0)
-            total_correct += (outputs.argmax(dim=1) == targets).sum().item()
-            total_seen += inputs.size(0)
+            bs = imgs.size(0)
+            total_loss += loss.item() * bs
+            total_seen += bs
+            sp_correct += (logits_sp.argmax(1) == y_sp).sum().item()
+            gn_correct += (logits_gn.argmax(1) == y_gn).sum().item()
+            fa_correct += (logits_fa.argmax(1) == y_fa).sum().item()
 
-    return total_loss / max(total_seen, 1), total_correct / max(total_seen, 1)
+    n = max(total_seen, 1)
+    return total_loss / n, sp_correct / n, gn_correct / n, fa_correct / n
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Pretrain a fish classification backbone."
+        description="Pretrain a TaxonomicMultiHead fish classifier."
     )
-    parser.add_argument("--data-dir", required=True)
+    parser.add_argument(
+        "--data-dir",
+        required=True,
+        help="Folder of per-species subfolders of reference images.",
+    )
+    parser.add_argument(
+        "--checklist",
+        required=True,
+        help="Andaman checklist CSV (species[, genus, family]).",
+    )
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--val-fraction", type=float, default=0.15)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--out", default="models/fish-classifier-0.pth")
+    parser.add_argument(
+        "--out",
+        default="models/checkpoints/fish-classifier-1.pth",
+        help="Checkpoint path, loadable directly by track_cleaning.py.",
+    )
+    parser.add_argument(
+        "--backbone",
+        default=None,
+        help="Optional ImageNet-pretrained state_dict to warm-start the trunk "
+        "(e.g. an old fish-classifier-0.pth). Omit for ImageNet init.",
+    )
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision.")
     args = parser.parse_args()
 
-    full_train_ds = datasets.ImageFolder(args.data_dir, transform=train_transform)
-    full_eval_ds = datasets.ImageFolder(args.data_dir, transform=eval_transform)
+    resolver = TaxonomyResolver(args.checklist)
 
-    num_classes = len(full_train_ds.classes)
-    if num_classes < 2:
-        raise SystemExit(f"Need ≥2 species folders; found {num_classes}.")
-
-    val_size = max(1, int(len(full_train_ds) * args.val_fraction))
-    train_size = len(full_train_ds) - val_size
-    gen = torch.Generator().manual_seed(42)
-    train_idx, val_idx = random_split(
-        range(len(full_train_ds)), [train_size, val_size], generator=gen
+    print(f"📂 Scanning {args.data_dir}…")
+    samples, sp_to_idx, gn_to_idx, fa_to_idx = scan_reference_folders(
+        args.data_dir, resolver
     )
-    train_subset = torch.utils.data.Subset(full_train_ds, train_idx.indices)
-    val_subset = torch.utils.data.Subset(full_eval_ds, val_idx.indices)
+    n_sp, n_gn, n_fa = len(sp_to_idx), len(gn_to_idx), len(fa_to_idx)
+
+    # Report any species whose genus/family came from the fallback rather than
+    # the checklist — good to know before you trust the genus/family heads.
+    unknown_family = sum(
+        1 for _, _, _, fa in samples if list(fa_to_idx.keys())[fa] == "Unknown_Family"
+    )
+    if unknown_family:
+        pct = 100.0 * unknown_family / len(samples)
+        print(
+            f" ⚠ {unknown_family} image(s) ({pct:.1f}%) have no checklist "
+            f"family; they will still train the species and genus heads."
+        )
+
+    print(f"Classes: sp={n_sp}  gn={n_gn}  fa={n_fa}  |  images: {len(samples)}")
+
+    # Split before wrapping in datasets so train/val see disjoint indices.
+    val_size = max(1, int(len(samples) * args.val_fraction))
+    train_size = len(samples) - val_size
+    if train_size < 1:
+        raise SystemExit("Not enough images to split into train/val.")
+
+    gen = torch.Generator().manual_seed(42)
+    perm = torch.randperm(len(samples), generator=gen).tolist()
+    train_samples = [samples[i] for i in perm[:train_size]]
+    val_samples = [samples[i] for i in perm[train_size:]]
+
+    train_ds = MultiHeadFishDataset(train_samples, TRAIN_TRANSFORM)
+    val_ds = MultiHeadFishDataset(val_samples, EVAL_TRANSFORM)
 
     train_loader = DataLoader(
-        train_subset,
+        train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
-        pin_memory=(device.type == "cuda"),
+        num_workers=2 if os.name != "nt" else 0,
+        pin_memory=(DEVICE.type == "cuda"),
     )
     val_loader = DataLoader(
-        val_subset,
+        val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
-        pin_memory=(device.type == "cuda"),
+        num_workers=2 if os.name != "nt" else 0,
+        pin_memory=(DEVICE.type == "cuda"),
     )
 
-    print(f"Classes ({num_classes}): {full_train_ds.classes}")
-    print(f"Train: {train_size} | Val: {val_size} | Device: {device}")
+    model = TaxonomicMultiHead(
+        backbone_path=args.backbone,
+        num_species=n_sp,
+        num_genera=n_gn,
+        num_families=n_fa,
+    ).to(DEVICE)
+    print(f" ➔ Device: {DEVICE}")
 
-    model = build_model(num_classes)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    w_sp = class_weights([s for _, s, _, _ in train_samples], n_sp)
+    w_gn = class_weights([g for _, _, g, _ in train_samples], n_gn)
+    w_fa = class_weights([f for _, _, _, f in train_samples], n_fa)
 
-    use_amp = args.amp and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    optimizer = optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr
+    )
+    use_amp = args.amp and DEVICE.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    best_val_acc = 0.0
+    bundle = (optimizer, w_sp, w_gn, w_fa)
+
+    best_val = 0.0
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = run_epoch(
-            model, train_loader, criterion, optimizer, scaler, use_amp
+        tr_loss, tr_sp, tr_gn, tr_fa = run_epoch(
+            model, train_loader, bundle, scaler, train=True, use_amp=use_amp
         )
-        val_loss, val_acc = run_epoch(model, val_loader, criterion)
+        va_loss, va_sp, va_gn, va_fa = run_epoch(
+            model, val_loader, bundle, scaler, train=False, use_amp=use_amp
+        )
 
         print(
             f"Epoch {epoch:02d}/{args.epochs} | "
-            f"train loss {train_loss:.4f} acc {train_acc:.3f} | "
-            f"val loss {val_loss:.4f} acc {val_acc:.3f}"
+            f"train loss {tr_loss:.4f} "
+            f"sp {tr_sp:.3f} gn {tr_gn:.3f} fa {tr_fa:.3f} | "
+            f"val loss {va_loss:.4f} "
+            f"sp {va_sp:.3f} gn {va_gn:.3f} fa {va_fa:.3f}"
         )
 
-        if val_acc >= best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), args.out)
-            print(f"  💾 Saved best backbone ({args.out}), val acc {val_acc:.3f}")
+        # Model selection: species accuracy dominates, genus/family as tiebreakers.
+        score = va_sp + 0.3 * va_gn + 0.1 * va_fa
+        if score >= best_val:
+            best_val = score
+            save_multhead_checkpoint(
+                model,
+                args.out,
+                sp_to_idx,
+                gn_to_idx,
+                fa_to_idx,
+                n_sp,
+                n_gn,
+                n_fa,
+            )
+            print(f"  💾 Saved ({args.out}) | composite val score {score:.3f}")
 
-    classes_path = args.out.replace(".pth", "_classes.txt")
-    with open(classes_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(full_train_ds.classes))
-    print(f"\nDone. Best val acc: {best_val_acc:.3f}. Class order: {classes_path}")
+    print(f"\nDone. Best composite val score: {best_val:.3f}")
+    print(f"Checkpoint: {args.out}")
+    print(
+        "This file is directly loadable by track_cleaning.py — run it now "
+        "and the GUI will make predictions from frame one."
+    )
+
+
+def save_multhead_checkpoint(
+    model, path, sp_to_idx, gn_to_idx, fa_to_idx, n_sp, n_gn, n_fa
+):
+    """
+    Writes the exact format track_cleaning.save_checkpoint produces so the two
+    are interchangeable on disk.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "sp_to_idx": sp_to_idx,
+            "gn_to_idx": gn_to_idx,
+            "fa_to_idx": fa_to_idx,
+            "num_species": n_sp,
+            "num_genera": n_gn,
+            "num_families": n_fa,
+        },
+        path,
+    )
 
 
 if __name__ == "__main__":

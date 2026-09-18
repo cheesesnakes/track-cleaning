@@ -2,9 +2,15 @@
 model.py
 
 Hierarchical multi-head classifier. One ResNet18 backbone feeds three
-linear heads (species / genus / family). Warm-starting from a pretrained
-backbone is handled at construction time — the fc weights from the
-pretraining checkpoint are simply discarded.
+linear heads (species / genus / family).
+
+Warm-starting from a pretrained ResNet18 state_dict is handled at
+construction time: the fc weights are discarded, the conv/bn weights are
+loaded into the trunk, and the three heads start from their default init.
+
+update_heads() grows or shrinks the heads while preserving the rows that
+already exist, so retraining during active learning keeps everything the
+model has already learned.
 """
 
 import torch
@@ -26,37 +32,82 @@ class TaxonomicMultiHead(nn.Module):
 
         if backbone_path is not None:
             state = torch.load(backbone_path, map_location="cpu")
-            state = {k: v for k, v in state.items() if not k.startswith("fc.")}
+            # Accept both raw resnet18 state_dicts (with 'fc.*') and our own
+            # multihead checkpoints (with 'fc_species.*' etc.) — strip anything
+            # that is clearly a classifier head so the trunk load is clean.
+            state = {
+                k: v
+                for k, v in state.items()
+                if not (
+                    k.startswith("fc.")
+                    or k.startswith("fc_species.")
+                    or k.startswith("fc_genus.")
+                    or k.startswith("fc_family.")
+                )
+            }
             missing, unexpected = backbone.load_state_dict(state, strict=False)
-            # missing == ['fc.weight', 'fc.bias'] is expected; anything else is not
+            # The only expected missing keys are the original 'fc.*' pair.
             extra_missing = [k for k in missing if not k.startswith("fc.")]
             if extra_missing:
-                print(f"   ⚠ backbone missing keys: {extra_missing}")
+                print(
+                    f"   ⚠ backbone missing keys: {extra_missing[:8]}"
+                    f"{' …' if len(extra_missing) > 8 else ''}"
+                )
             if unexpected:
-                print(f"   ⚠ backbone unexpected keys: {unexpected}")
+                print(
+                    f"   ⚠ backbone unexpected keys: {unexpected[:8]}"
+                    f"{' …' if len(unexpected) > 8 else ''}"
+                )
 
         self.feature_dim = backbone.fc.in_features
-        # Strip the final fc; keep avgpool
+        # Drop fc, keep avgpool.  nn.Sequential indices map to:
+        #   0 conv1, 1 bn1, 2 relu, 3 maxpool, 4-7 layer1-4, 8 avgpool
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
 
-        self.fc_species = nn.Linear(self.feature_dim, num_species)
-        self.fc_genus = nn.Linear(self.feature_dim, num_genera)
-        self.fc_family = nn.Linear(self.feature_dim, num_families)
+        self.fc_species = nn.Linear(self.feature_dim, max(num_species, 2))
+        self.fc_genus = nn.Linear(self.feature_dim, max(num_genera, 2))
+        self.fc_family = nn.Linear(self.feature_dim, max(num_families, 2))
 
     def forward(self, x):
         f = self.backbone(x).flatten(1)
         return self.fc_species(f), self.fc_genus(f), self.fc_family(f)
 
+    # ------------------------------------------------------------------
+    # Head management
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _grow_head(old_head: nn.Linear, new_n: int) -> nn.Linear:
+        """
+        Return a Linear with `new_n` outputs whose first min(old, new) rows
+        are copied from `old_head`.  Any newly added rows keep the default
+        initialisation.  If `new_n == old_n` the original module is
+        returned unchanged so its optimizer state (if any) survives.
+        """
+        new_n = max(int(new_n), 2)
+        old_n, feat_dim = old_head.weight.shape
+        if new_n == old_n:
+            return old_head
+
+        new_head = nn.Linear(feat_dim, new_n).to(old_head.weight.device)
+        copy_n = min(old_n, new_n)
+        with torch.no_grad():
+            new_head.weight[:copy_n] = old_head.weight[:copy_n]
+            new_head.bias[:copy_n] = old_head.bias[:copy_n]
+        return new_head
+
     def update_heads(self, num_species, num_genera, num_families):
         """
-        Rebuild only the classification heads, preserving the (trained)
-        backbone. Called whenever the label set grows.
+        Resize the three classifier heads in place, preserving every row
+        that already exists.  Called whenever the label set grows during
+        active learning.  The backbone is never touched.
         """
-        device = next(self.parameters()).device
-        self.fc_species = nn.Linear(self.feature_dim, max(num_species, 2)).to(device)
-        self.fc_genus = nn.Linear(self.feature_dim, max(num_genera, 2)).to(device)
-        self.fc_family = nn.Linear(self.feature_dim, max(num_families, 2)).to(device)
+        self.fc_species = self._grow_head(self.fc_species, num_species)
+        self.fc_genus = self._grow_head(self.fc_genus, num_genera)
+        self.fc_family = self._grow_head(self.fc_family, num_families)
 
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
     @property
     def num_species(self):
         return self.fc_species.out_features
