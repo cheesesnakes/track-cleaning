@@ -30,6 +30,9 @@ Features:
     retrains, so trained head rows are never silently reassigned.
   • Labeled CSV is flushed at every milestone and on exit, preserving the
     input's subfolder structure under ./output/tracks/.
+  • Family resolution uses the same layered resolver as train.py: checklist,
+    optional secondary CSV, then GBIF, with a shared on-disk cache so the
+    second run is offline-instant.
 
 Usage:
     python track_cleaning.py
@@ -39,9 +42,11 @@ Usage:
     line falls back to a Qt file/folder selection dialog.
 
 Inputs:
-    --csv/-c          Tracking CSV (needs at least: frame, id, x1, y1, x2, y2).
-    --checklist/-l    Andaman checklist CSV with columns: species, genus, family.
-    --frames-dir/-f   Parent folder containing the video's frame images.
+    --csv/-c                   Tracking CSV (frame, id, x1, y1, x2, y2).
+    --checklist/-l             Andaman checklist CSV (species, genus, family).
+    --frames-dir/-f            Parent folder containing the video's frames.
+    --secondary-taxonomy       Optional broader taxonomy CSV for families.
+    --gbif-cache               JSON cache for GBIF results (shared with train.py).
 
 Outputs:
     ./output/tracks/...           Labeled CSV, mirroring the annotated_videos
@@ -102,6 +107,7 @@ CHECKPOINT_DIR = "./models/checkpoints"
 MULTIHEAD_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "fish-classifier-1.pth")
 BACKBONE_PATH = "./models/fish-classifier-0.pth"
 CSV_OUT = "./output/tracks"
+DEFAULT_GBIF_CACHE = "./output/.gbif_cache.json"
 
 RETRAIN_INTERVAL = 150
 BATCH_SIZE = 32
@@ -136,22 +142,16 @@ EVAL_TRANSFORM = transforms.Compose(
 # ==========================================
 def get_output_csv_path(input_csv_path, output_base_dir):
     """
-    Computes output path inside output_base_dir preserving the subfolder
-    structure starting after 'annotated_videos'.
-
-    Example:
-      Input:  /data/projects/annotated_videos/site_1/cam_A/labels.csv
-      Output: ./output/tracks/site_1/cam_A/labels.csv
+    Output path inside output_base_dir preserving the subfolder structure
+    starting after 'annotated_videos'.
     """
     abs_input = Path(input_csv_path).resolve()
     parts = abs_input.parts
-
     if "annotated_videos" in parts:
         idx = parts.index("annotated_videos")
         relative_path = Path(*parts[idx + 1 :])
     else:
         relative_path = Path(abs_input.name)
-
     target_path = Path(output_base_dir) / relative_path
     target_path.parent.mkdir(parents=True, exist_ok=True)
     return target_path
@@ -179,7 +179,7 @@ def parse_args():
         dest="checklist_path",
         type=str,
         default=None,
-        help="Path to the Andaman checklist CSV (columns: species, genus, family).",
+        help="Path to the Andaman checklist CSV.",
     )
     parser.add_argument(
         "-f",
@@ -187,7 +187,17 @@ def parse_args():
         dest="root_data_dir",
         type=str,
         default=None,
-        help="Path to the parent folder containing the frames for this video.",
+        help="Path to the parent folder containing the frames.",
+    )
+    parser.add_argument(
+        "--secondary-taxonomy",
+        default=None,
+        help="Optional broader taxonomy CSV used before GBIF.",
+    )
+    parser.add_argument(
+        "--gbif-cache",
+        default=DEFAULT_GBIF_CACHE,
+        help="JSON cache for GBIF results. Share with train.py.",
     )
     return parser.parse_args()
 
@@ -196,9 +206,7 @@ def get_user_paths(csv_path=None, checklist_path=None, root_data_dir=None):
     """
     Resolves the three required inputs. Any value already supplied (e.g. via
     CLI args) is used as-is after validation; anything missing is prompted
-    for via a Qt file/folder dialog.
-
-    QApplication must already exist before calling this.
+    for via a Qt file/folder dialog. QApplication must exist before calling.
     """
     if csv_path:
         if not os.path.isfile(csv_path):
@@ -219,7 +227,7 @@ def get_user_paths(csv_path=None, checklist_path=None, root_data_dir=None):
     else:
         checklist_path, _ = QFileDialog.getOpenFileName(
             None,
-            "Select Andaman Checklist CSV (columns: species, genus, family)",
+            "Select Andaman Checklist CSV",
             "",
             "CSV Files (*.csv);;All Files (*)",
         )
@@ -256,15 +264,34 @@ def locate_frame_path(index, frame_num):
         n = int(frame_num)
     except (ValueError, TypeError):
         return None
-
     for candidate in (f"frame{n:06d}.jpg", f"frame{n}.jpg", f"_{n:04d}.jpg"):
         if candidate in index:
             return index[candidate]
-
     for name, path in index.items():
         if name.endswith(f"frame{n:06d}.jpg") or name.endswith(f"frame{n}.jpg"):
             return path
     return None
+
+
+def prewarm_resolver_from_existing_crops(resolver):
+    """
+    Resolve every genus already present under OUTPUT_CROP_DIR before the GUI
+    opens, so any GBIF lookups happen during startup (which is already slow)
+    rather than mid-labeling on the Qt main thread.  Usually a no-op because
+    the cache was written at the end of the previous session.
+    """
+    root = Path(OUTPUT_CROP_DIR)
+    if not root.exists():
+        return
+    genera = set()
+    for d in root.iterdir():
+        if not d.is_dir():
+            continue
+        _, genus, _ = resolver.resolve(d.name)  # may hit GBIF; populates cache
+        if genus and genus.lower() not in ("unknown", "unidentified"):
+            genera.add(genus)
+    if genera:
+        resolver.prewarm(genera, batch_log_every=25)
 
 
 # ==========================================
@@ -277,7 +304,6 @@ class FishCropDataset(Dataset):
         root = Path(crop_dir)
         if not root.exists():
             return
-
         for species_dir in sorted(root.iterdir()):
             if not species_dir.is_dir():
                 continue
@@ -310,9 +336,9 @@ def build_label_maps(crop_dir, resolver, prev_sp=None, prev_gn=None, prev_fa=Non
 
     If previous maps are supplied, ALL previously-known classes keep their
     indices (even those with no crops on disk right now), and new classes
-    found in `crop_dir` are appended alphabetically.  This is critical: a
-    naive re-sort would reassign species → index between retrains, silently
-    pointing the head weights at the wrong species.
+    found in `crop_dir` are appended alphabetically.  A naive re-sort would
+    reassign species → index between retrains, silently pointing the head
+    weights at the wrong species.
     """
     sp_set, gn_set, fa_set = set(), set(), set()
     root = Path(crop_dir)
@@ -330,21 +356,16 @@ def build_label_maps(crop_dir, resolver, prev_sp=None, prev_gn=None, prev_fa=Non
     def stable(existing, keys):
         existing = existing or {}
         out = {}
-        # Preserve every previously-known class at its old index.
         for k, i in sorted(existing.items(), key=lambda kv: kv[1]):
             out[k] = i
         next_idx = (max(out.values()) + 1) if out else 0
-        # Append new keys alphabetically after the highest existing index.
         for k in sorted(keys):
             if k not in out:
                 out[k] = next_idx
                 next_idx += 1
         return out
 
-    sp_to_idx = stable(prev_sp, sp_set)
-    gn_to_idx = stable(prev_gn, gn_set)
-    fa_to_idx = stable(prev_fa, fa_set)
-    return sp_to_idx, gn_to_idx, fa_to_idx
+    return (stable(prev_sp, sp_set), stable(prev_gn, gn_set), stable(prev_fa, fa_set))
 
 
 def compute_class_weights(labels, num_classes):
@@ -374,8 +395,10 @@ def retrain(
     Full retrain pass.  `log` is a callable that receives status strings so
     the caller (Qt worker) can route them into the UI instead of stdout.
 
-    `prev_*` maps, if given, are used to preserve class indices across
-    retrains so a growing label set never reshuffles the head weights.
+    `prev_*` maps preserve class indices across retrains so a growing label
+    set never reshuffles the head weights.  Samples whose family is
+    'Unknown_Family' are excluded from the family loss — the head still has
+    a slot for that class, but it's never trained to predict it.
     """
     sp_to_idx, gn_to_idx, fa_to_idx = build_label_maps(
         OUTPUT_CROP_DIR,
@@ -399,6 +422,8 @@ def retrain(
     if len(ds) < 4:
         log(f"⏸ Skipping retrain — only {len(ds)} crops on disk.")
         return None, None, None
+
+    ignore_family_idx = fa_to_idx.get("Unknown_Family")
 
     model.update_heads(n_sp, n_gn, n_fa)
     model.to(DEVICE)
@@ -434,11 +459,20 @@ def retrain(
             optimizer.zero_grad()
             with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
                 logits_sp, logits_gn, logits_fa = model(imgs)
-                loss = (
-                    F.cross_entropy(logits_sp, y_sp, weight=w_sp)
-                    + LAMBDA_GENUS * F.cross_entropy(logits_gn, y_gn, weight=w_gn)
-                    + LAMBDA_FAMILY * F.cross_entropy(logits_fa, y_fa, weight=w_fa)
-                )
+                loss_sp = F.cross_entropy(logits_sp, y_sp, weight=w_sp)
+                loss_gn = F.cross_entropy(logits_gn, y_gn, weight=w_gn)
+                if ignore_family_idx is not None:
+                    mask = y_fa != ignore_family_idx
+                    if mask.any():
+                        loss_fa = F.cross_entropy(
+                            logits_fa[mask], y_fa[mask], weight=w_fa
+                        )
+                    else:
+                        loss_fa = logits_fa.sum() * 0.0
+                else:
+                    loss_fa = F.cross_entropy(logits_fa, y_fa, weight=w_fa)
+                loss = loss_sp + LAMBDA_GENUS * loss_gn + LAMBDA_FAMILY * loss_fa
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -473,8 +507,8 @@ def save_checkpoint(model, sp_to_idx, gn_to_idx, fa_to_idx):
 def _infer_head_sizes_from_state_dict(state_dict):
     """
     Recover (num_species, num_genera, num_families) from a checkpoint whose
-    explicit size keys are missing (older save format).  Looks for any
-    state_dict key ending in a head-weight suffix and reads dim 0.
+    explicit size keys are missing (older save format).  Reads dim 0 of any
+    state_dict tensor whose key ends in a head-weight suffix.
     """
 
     def _find(suffixes):
@@ -503,7 +537,7 @@ def build_or_load_model(backbone_path=None):
         gn_to_idx = ckpt.get("gn_to_idx") or {}
         fa_to_idx = ckpt.get("fa_to_idx") or {}
 
-        # Fallback chain: explicit keys → label-map lengths → head shapes.
+        # Fallback: explicit keys → label-map lengths → head tensor shapes.
         if n_sp is None and sp_to_idx:
             n_sp = len(sp_to_idx)
         if n_gn is None and gn_to_idx:
@@ -548,10 +582,7 @@ def build_or_load_model(backbone_path=None):
         ).to(DEVICE)
     else:
         if backbone_path:
-            print(
-                f" ⚠ Backbone {backbone_path} not found — "
-                f"starting without ImageNet-pretrained fish features."
-            )
+            print(f" ⚠ Backbone {backbone_path} not found — starting cold.")
         model = TaxonomicMultiHead(
             backbone_path=None,
             num_species=2,
@@ -588,14 +619,9 @@ def predict(model, img_tensor, sp_inv, gn_inv, fa_inv):
 # ==========================================
 class RetrainWorker(QThread):
     """
-    Runs retrain() off the Qt main thread.
-
-    Emits `progress(str)` for status messages and
-    `finished_with_result(sp_to_idx, gn_to_idx, fa_to_idx)` when done.
-    On skip/failure the three payload objects are None.
-
-    While a worker is running, do NOT call predict()/model(...) from the
-    main thread — the worker mutates the same module in place.
+    Runs retrain() off the Qt main thread.  While this worker is alive, do
+    NOT call predict()/model(...) from the main thread — the worker mutates
+    the same module in place.
     """
 
     progress = Signal(str)
@@ -619,7 +645,7 @@ class RetrainWorker(QThread):
                 prev_gn=self.prev_gn,
                 prev_fa=self.prev_fa,
             )
-        except Exception as exc:  # noqa: BLE001 - surface anything to the UI
+        except Exception as exc:  # noqa: BLE001
             self.progress.emit(f"❌ Retrain failed: {exc}")
             result = (None, None, None)
         self.finished_with_result.emit(*result)
@@ -643,7 +669,6 @@ class ZoomableImageView(QGraphicsView):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self._pixmap_item = QGraphicsPixmapItem()
@@ -661,7 +686,6 @@ class ZoomableImageView(QGraphicsView):
         self._current_scale = 1.0
         self._fit_on_next_resize = True
 
-    # ---------- public API ----------
     def set_pixmap(self, pixmap: QPixmap):
         self._pixmap_item.setPixmap(pixmap)
         self._scene.setSceneRect(self._pixmap_item.boundingRect())
@@ -689,8 +713,7 @@ class ZoomableImageView(QGraphicsView):
     def zoom_out(self):
         self._zoom_center(1 / 1.25)
 
-    # ---------- internals ----------
-    def _zoom_at(self, factor: float, view_pos):
+    def _zoom_at(self, factor, view_pos):
         new_scale = self._current_scale * factor
         if not (self.MIN_SCALE <= new_scale <= self.MAX_SCALE):
             return
@@ -702,7 +725,7 @@ class ZoomableImageView(QGraphicsView):
         self._current_scale = self.transform().m11()
         self._fit_on_next_resize = False
 
-    def _zoom_center(self, factor: float):
+    def _zoom_center(self, factor):
         new_scale = self._current_scale * factor
         if not (self.MIN_SCALE <= new_scale <= self.MAX_SCALE):
             return
@@ -710,8 +733,7 @@ class ZoomableImageView(QGraphicsView):
         self._current_scale = self.transform().m11()
         self._fit_on_next_resize = False
 
-    # ---------- Qt events ----------
-    def wheelEvent(self, event):  # noqa: N802 - Qt API
+    def wheelEvent(self, event):  # noqa: N802
         delta = event.angleDelta().y()
         if delta == 0:
             event.ignore()
@@ -720,14 +742,14 @@ class ZoomableImageView(QGraphicsView):
         self._zoom_at(factor, event.position().toPoint())
         event.accept()
 
-    def mouseDoubleClickEvent(self, event):  # noqa: N802 - Qt API
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
         if abs(self._current_scale - 1.0) < 1e-3:
             self.fit_to_view()
         else:
             self.zoom_to_100()
         event.accept()
 
-    def resizeEvent(self, event):  # noqa: N802 - Qt API
+    def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
         if self._fit_on_next_resize:
             self.fit_to_view()
@@ -947,7 +969,7 @@ class LabelerWindow(QMainWindow):
             return
 
         row = self.current_row
-        # resolver normalizes both sides and returns the canonical key.
+        # Resolver normalizes both sides and returns the canonical key.
         final_species, final_genus, final_family = self.resolver.resolve(final_species)
 
         if final_family == "Unknown_Family" and self.current_model_family:
@@ -1021,7 +1043,7 @@ class LabelerWindow(QMainWindow):
         self._advance()
 
     # ---------- shutdown ----------
-    def closeEvent(self, event):  # noqa: N802 - Qt API
+    def closeEvent(self, event):  # noqa: N802
         if self._closing:
             event.accept()
             return
@@ -1055,6 +1077,13 @@ class LabelerWindow(QMainWindow):
             self.fa_to_idx = fa_to_idx
         save_checkpoint(self.model, self.sp_to_idx, self.gn_to_idx, self.fa_to_idx)
         self.df.to_csv(self.out_csv_path, index=False)
+
+        # Persist any GBIF results from this session so the next run is offline.
+        try:
+            self.resolver.finalize()
+        except Exception as exc:  # noqa: BLE001
+            print(f" ⚠ Could not finalize resolver cache: {exc}")
+
         print(f"🏁 Session closed. Progress saved to: {self.out_csv_path}")
         self.retrain_worker = None
         self.close()
@@ -1076,15 +1105,27 @@ def execute_pipeline():
 
     out_csv_path = str(get_output_csv_path(csv_path, CSV_OUT))
 
-    resolver = TaxonomyResolver(checklist_path)
+    # Layered resolver: checklist → secondary CSV → GBIF → cache.
+    resolver = TaxonomyResolver(
+        checklist_path,
+        secondary_csv=args.secondary_taxonomy,
+        cache_path=args.gbif_cache,
+        verbose=True,
+    )
 
     print(f"\nCUDA status: {torch.cuda.is_available()} | Device: {DEVICE}")
     print(f"Master sheet (In) : {csv_path}")
     print(f"Master sheet (Out): {out_csv_path}")
     print(f"Checklist:          {checklist_path}")
     print(f"Frames folder:      {root_data_dir}")
+    print(f"GBIF cache:         {args.gbif_cache}")
 
     os.makedirs(OUTPUT_CROP_DIR, exist_ok=True)
+
+    # Prewarm before the GUI opens: any GBIF work happens here, not during
+    # labeling.  Usually a no-op because the cache was written last session.
+    print("\n📚 Resolving taxonomy for existing crop folders…")
+    prewarm_resolver_from_existing_crops(resolver)
 
     print("\n📂 Indexing frames...")
     frame_index = build_frame_index(root_data_dir)

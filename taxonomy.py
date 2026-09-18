@@ -22,10 +22,8 @@ the resolver tries, in order:
      broader genus→family or species→family mappings.
   2. A JSON cache on disk (`cache_path=`) of genera already resolved via
      GBIF in a previous run.
-  3. The GBIF species/match API (`allow_gbif=True`, the default), queried
-     once per genus and cached.  No API key required.
-
-Pass `allow_gbif=False` for a fully offline, deterministic resolver.
+  3. The GBIF species/match API, queried once per genus and cached so the
+     second run is offline and instant.  No API key required.
 
 Used by track_cleaning.py, validate.py, and FishCropDataset.
 """
@@ -58,19 +56,16 @@ class TaxonomyResolver:
         self,
         checklist_path,
         secondary_csv=None,
-        cache_path="./taxonomy/.gbif_cache.json",
-        allow_gbif=True,
+        cache_path="./output/.gbif_cache.json",
         gbif_timeout=10.0,
         gbif_min_interval=0.1,
         verbose=True,
     ):
         self.verbose = verbose
-        self.allow_gbif = allow_gbif
         self.gbif_timeout = gbif_timeout
         self.gbif_min_interval = gbif_min_interval
         self.cache_path = Path(cache_path) if cache_path else None
 
-        # Counters for finalize() reporting.
         self._stats = {
             "checklist": 0,
             "secondary": 0,
@@ -282,7 +277,7 @@ class TaxonomyResolver:
             family = self.genus_to_family.get(g_lc)
             if family:
                 self._stats["secondary"] += 1
-            elif self.allow_gbif and g_lc and g_lc not in self._lookup_attempted:
+            elif g_lc and g_lc not in self._lookup_attempted:
                 self._lookup_attempted.add(g_lc)
                 family = self._gbif_lookup(genus)
                 if family:
@@ -312,8 +307,6 @@ class TaxonomyResolver:
         doesn't interleave network I/O.  At most one query per unique genus
         per process; already-cached genera are skipped.
         """
-        if not self.allow_gbif:
-            return
         unique = sorted({g for g in genera if g})
         pending = [g for g in unique if g.lower() not in self.genus_to_family]
         if not pending:

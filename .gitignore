@@ -2,3 +2,4 @@ annotated_frames/
 images/
 output/
 models/
+__pycache__
