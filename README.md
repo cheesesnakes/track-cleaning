@@ -1,9 +1,9 @@
 # Andaman Reef Fish — Active Learning System
 
 Local, privacy-focused pipeline for identifying reef fish from video-derived
-frames, with hierarchical (species / genus / family) classification, GUI
-path selection, track-level mass labeling, and periodic GPU retraining on
-an NVIDIA RTX 4070 (or any CUDA device).
+frames, with hierarchical (species / genus / family) classification, a Qt
+labeling GUI, track-level mass labeling, zoom/pan inspection, and periodic
+GPU retraining on an NVIDIA RTX 4070 (or any CUDA device).
 
 ---
 
@@ -16,16 +16,17 @@ an NVIDIA RTX 4070 (or any CUDA device).
                             ▼
                  ┌──────────────────────┐
                  │      train.py        │  Pretrain ResNet18 backbone
-                 └──────────┬───────────┘  → pretrained_backbone.pth
+                 └──────────┬───────────┘  → fish-classifier-0.pth
                             ▼
     ┌───────────────────────────────────────────────┐
     │            track_cleaning.py                  │
-    │  • GUI path selection                         │
+    │  • Qt path dialogs                            │
     │  • Frame index (O(1) lookup)                  │
     │  • Multi-head model (sp / genus / family)     │
+    │  • Zoomable / pannable viewer                 │
     │  • Track-level mass assignment                │
-    │  • Retrain every 150 actions                  │
-    │  • Checkpoint to ./checkpoints/               │
+    │  • Retrain every 150 actions (worker thread)  │
+    │  • Checkpoint to ./models/checkpoints/        │
     └──────────┬────────────────────────────────────┘
                ▼
     ┌──────────────────────┐
@@ -41,7 +42,7 @@ an NVIDIA RTX 4070 (or any CUDA device).
 |---|---|
 | `taxonomy.py` | Loads Andaman checklist, resolves species → genus/family |
 | `model.py` | `TaxonomicMultiHead` — shared ResNet18 + 3 linear heads |
-| `track_cleaning.py` | Main active-learning loop (GUI + label + retrain) |
+| `track_cleaning.py` | Main active-learning loop (Qt GUI + label + retrain) |
 | `train.py` | Pretrain a ResNet18 backbone on reference imagery |
 | `validate.py` | Checklist validation with suggested corrections |
 | `download_images.py` | GBIF + iNaturalist fetch, plus local dataset ingest |
@@ -51,7 +52,7 @@ an NVIDIA RTX 4070 (or any CUDA device).
 ## Setup
 
 ```bash
-pip install torch torchvision pandas opencv-python numpy pillow requests
+pip install torch torchvision pandas opencv-python numpy pillow requests PySide6
 ```
 
 For GPU acceleration install the CUDA build of PyTorch from
@@ -131,37 +132,60 @@ The ingested dataset should be in ImageFolder layout (one folder per species).
 python train.py \
     --data-dir ./reference_images \
     --epochs 15 --batch-size 32 \
-    --out pretrained_backbone.pth \
+    --out models/fish-classifier-0.pth \
     --amp
 ```
 
-Produces `pretrained_backbone.pth`. Only its conv-layer weights are used
+Produces `fish-classifier-0.pth`. Only its conv-layer weights are used
 downstream — the `fc` head is discarded.
 
 ### 3. Run the active-learning loop
 
 ```bash
 python track_cleaning.py
+# or with explicit paths:
+python track_cleaning.py \
+    --csv  /data/annotated_videos/site_1/cam_A/tracks.csv \
+    --checklist andaman_checklist.csv \
+    --frames-dir /data/frames/site_1/cam_A
 ```
 
-You will be prompted for three files/folders via native OS dialogs:
+If any of `--csv/-c`, `--checklist/-l`, `--frames-dir/-f` is omitted, a
+native Qt file/folder dialog opens for that input. The pipeline then
+displays one representative frame per unlabeled track.
 
-1. Master tracking CSV
-2. Andaman checklist CSV
-3. Frames parent directory
+### 4. Label
 
-At each unlabeled frame:
+Each unlabeled track appears in the **Active Classification Workspace**:
 
 | Input | Effect |
 |---|---|
 | **Blank + Enter** | Accepts the model (or CSV) suggestion |
 | **species name + Enter** | Overrides, e.g. `lutjanus_decussatus` |
-| **exit** | Runs a final retrain, saves checkpoints and CSV, closes |
+| **exit** (or window close / Ctrl+Q) | Runs a final retrain, saves checkpoints and CSV, closes |
+
+The status bar shows the model's softmax confidence at each taxonomic
+level (`sp=…% gn=…% fa=…%`) so you can see when the model is uncertain.
 
 Labels are mass-assigned to **all frames with the same track ID** — one
 action covers dozens of frames.
 
-### 4. Validate against the checklist
+### Viewer controls
+
+| Action | Gesture |
+|---|---|
+| Zoom in / out | Scroll wheel (zooms under cursor) |
+| Pan | Click-and-drag |
+| Fit to window | Double-click, or `Ctrl+0` |
+| 1:1 pixels | Double-click again, or `Ctrl+1` |
+| Fine zoom in | `Ctrl+=` |
+| Fine zoom out | `Ctrl+-` |
+| Quit + save | `Ctrl+Q`, or the window close button |
+
+Zoom limits are 0.05×–40×, enough to inspect fin rays or jaw shape on a
+4K frame.
+
+### 5. Validate against the checklist
 
 ```bash
 python validate.py \
@@ -178,7 +202,7 @@ flagged rows.
 
 ## How Retraining Works
 
-Every 150 labeling actions (and again on exit):
+Every 150 labeling actions (and once more on exit):
 
 1. All crops in `labeled_fish_crops/` are indexed.
 2. Species / genus / family label sets are derived from the crops,
@@ -191,7 +215,22 @@ Every 150 labeling actions (and again on exit):
    - Class-weighted cross-entropy at each level
    - Loss = `L_species + 0.3·L_genus + 0.1·L_family`
    - Mixed precision on CUDA
-5. Checkpoint saved to `./checkpoints/fish_multihead.pth`.
+5. Checkpoint saved to `./models/checkpoints/fish-classifier-1.pth`.
+
+### Threading
+
+Retraining runs on a **`QThread` worker**. The Qt event loop keeps
+draining during training, so the window stays responsive: you can resize,
+pan, or zoom the current image, and the status bar streams progress
+(`epoch 1/5 | loss …`). Input is disabled while the worker owns the
+model, since it mutates the same `TaxonomicMultiHead` instance used for
+inference. When the worker finishes, the updated heads are swapped in and
+the next track is shown automatically.
+
+Closing the window (X button), pressing `Ctrl+Q`, or typing `exit` all
+route through the same shutdown path: the current CSV is flushed, one
+final retrain runs on the worker, the checkpoint is written, and the app
+quits cleanly.
 
 ### Why multi-head, not three separate models?
 
@@ -218,6 +257,9 @@ Top of `track_cleaning.py`:
 | `LAMBDA_GENUS` | `0.3` | Genus loss weight |
 | `LAMBDA_FAMILY` | `0.1` | Family loss weight |
 | `BATCH_SIZE` | `32` | Retrain batch size |
+| `MULTIHEAD_CHECKPOINT` | `./models/checkpoints/fish-classifier-1.pth` | Checkpoint path |
+| `OUTPUT_CROP_DIR` | `./output/labeled_fish_crops` | Crop corpus root |
+| `CSV_OUT` | `./output/tracks` | Output CSV root |
 
 Top of `train.py` (via CLI): `--epochs`, `--batch-size`, `--lr`, `--amp`.
 
@@ -227,11 +269,15 @@ Top of `train.py` (via CLI): `--epochs`, `--batch-size`, `--lr`, `--amp`.
 
 | Path | Contents |
 |---|---|
-| `labeled_fish_crops/<species>/*.jpg` | Cropped fish from every labeled track |
+| `output/labeled_fish_crops/<species>/*.jpg` | Cropped fish from every labeled track |
+| `output/tracks/<...>/tracks.csv` | Labeled CSV, mirroring the input's subfolder layout under `annotated_videos/` |
 | `models/checkpoints/fish-classifier-1.pth` | Latest multi-head weights + label maps |
-| `modes/fish-classifier-0.pth` | ResNet18 conv weights from `train.py` |
+| `models/fish-classifier-0.pth` | ResNet18 conv weights from `train.py` |
 | `output/validation_report.csv` | Flagged rows + suggested corrections |
 | `output/reference_images/provenance_log.csv` | Source / license for every reference image |
+
+The output CSV is flushed at every retrain milestone and once more on
+exit, so an unexpected shutdown loses at most `RETRAIN_INTERVAL` labels.
 
 ---
 
