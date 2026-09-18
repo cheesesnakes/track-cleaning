@@ -70,7 +70,7 @@ PROVENANCE_FIELDS = [
 # Detector (global, loaded once)
 # --------------------------------------------------------------------------
 
-DETECTOR_WEIGHTS_PATH = "./models/fish_detector_v26_n3.pt"
+DETECTOR_WEIGHTS_PATH = "./weights/fish_static_best.pt"
 CROP_IMGSZ = 1280
 
 # Global holding the loaded detector + its crop settings, or None if no
@@ -361,6 +361,12 @@ def main():
         help="If no fish is detected in an image, save it uncropped instead "
         "of skipping it.",
     )
+    parser.add_argument(
+        "--skip-remote",
+        action="store_true",
+        help="Skip the GBIF/iNaturalist fetch loop entirely (e.g. for "
+        "ingest-only runs against a local dataset).",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -398,7 +404,10 @@ def main():
                 args.keep_undetected,
             )
 
-        for row in species_rows:
+        if args.skip_remote:
+            print("\n⏭  --skip-remote set, not querying GBIF/iNaturalist.")
+
+        for row in [] if args.skip_remote else species_rows:
             species_name = row["species"].strip()
             if not species_name:
                 continue
