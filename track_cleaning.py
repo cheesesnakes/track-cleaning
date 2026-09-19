@@ -1197,9 +1197,20 @@ class LabelerWindow(QMainWindow):
         QShortcut(QKeySequence("Alt+n"), self, activated=self._assign_new_id)
         QShortcut(QKeySequence("Alt+s"), self, activated=self._split_here)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self._enter_review_mode)
-        QShortcut(QKeySequence("Space"), self, activated=self._review_skip)
-        QShortcut(QKeySequence("S"), self, activated=self._review_split)
-        QShortcut(QKeySequence("Escape"), self, activated=self._review_exit)
+
+        # Review-only shortcuts. Disabled by default so they don't swallow
+        # Space / Shift+S while the user is typing a species name.
+        self._review_shortcuts = [
+            QShortcut(QKeySequence("Space"), self, activated=self._review_skip),
+            QShortcut(QKeySequence("S"), self, activated=self._review_split),
+            QShortcut(QKeySequence("Escape"), self, activated=self._review_exit),
+        ]
+        for sc in self._review_shortcuts:
+            sc.setEnabled(False)
+
+    def _enable_review_shortcuts(self, enabled: bool):
+        for sc in self._review_shortcuts:
+            sc.setEnabled(enabled)
 
     # ---------- image handling ----------
     def _set_image(self, bgr):
@@ -1210,43 +1221,32 @@ class LabelerWindow(QMainWindow):
         self.image_view.set_pixmap(self._current_pixmap)
 
     # ---------- navigation ----------
-    def _find_next_unlabeled(self, start):
-        for i in range(start, len(self.df)):
-            if pd.isna(self.df.at[i, "assigned_species"]):
-                return i
-        return -1
-
     def _advance(self):
-        # Scan from row 0 so splits that leave an unlabeled prefix behind
-        # are still picked up.
-        next_idx = self._find_next_unlabeled(0)
-        if next_idx == -1:
-            self.statusBar().showMessage("✅ All tracks labeled. Finalizing…")
-            self._set_input_enabled(False)
-            QTimer.singleShot(400, self.close)
-            return
-        self._show_index(next_idx)
+        """Show the first unlabeled row whose frame is loadable."""
+        for i in range(len(self.df)):
+            if pd.isna(self.df.iloc[i]["assigned_species"]) and self._show_index(i):
+                return
+        self.statusBar().showMessage("✅ All tracks labeled. Finalizing…")
+        self._set_input_enabled(False)
+        QTimer.singleShot(400, self.close)
 
     def _show_index(self, idx):
+        """Display row `idx`. Returns True on success, False on missing/unreadable frame."""
         row = self.df.iloc[idx]
         img_path = locate_frame_path(self.frame_index, row["frame"])
         if not img_path or not os.path.exists(img_path):
-            self.current_idx = idx
-            QTimer.singleShot(0, self._advance)
-            return
+            return False
 
         img = cv2.imread(img_path)
         if img is None:
-            self.current_idx = idx
-            QTimer.singleShot(0, self._advance)
-            return
+            return False
 
         x1, y1, x2, y2 = int(row["x1"]), int(row["y1"]), int(row["x2"]), int(row["y2"])
         cropped = img[y1:y2, x1:x2]
         if cropped.size == 0:
-            self.current_idx = idx
-            QTimer.singleShot(0, self._advance)
-            return
+            return False
+
+        prev_id = self.current_row["id"] if self.current_row is not None else None
 
         self.current_idx = idx
         self.current_row = row
@@ -1306,8 +1306,11 @@ class LabelerWindow(QMainWindow):
             self.reco_label.setText("Recommendation: (model not yet trained)")
 
         self.true_id_entry.setText(str(row["true_id"]))
-        self.entry.clear()
+        # Only reset the species entry when we move to a different fish.
+        if prev_id != row["id"]:
+            self.entry.clear()
         self.entry.setFocus()
+        return True
 
     # ---------- true_id / frame navigation ----------
     def _parse_true_id(self, text):
@@ -1356,9 +1359,14 @@ class LabelerWindow(QMainWindow):
     def _nav_frame(self, delta):
         if not self._track_row_indices:
             return
-        new_pos = self._track_pos + delta
-        if 0 <= new_pos < len(self._track_row_indices):
-            self._show_index(self._track_row_indices[new_pos])
+        n = len(self._track_row_indices)
+        step = 1 if delta > 0 else -1
+        pos = self._track_pos + step
+        while 0 <= pos < n:
+            if self._show_index(self._track_row_indices[pos]):
+                return
+            pos += step
+        self.statusBar().showMessage("No more frames for this track.")
 
     # ---------- input handling ----------
     def _set_input_enabled(self, enabled: bool):
@@ -1461,6 +1469,7 @@ class LabelerWindow(QMainWindow):
         self.review_pos = -1
         self.review_mode = True
         self.review_stats = {"n": 0, "splits": 0, "merges": 0}
+        self._enable_review_shortcuts(True)
         self.statusBar().showMessage(
             f"🔎 {len(self.review_queue)} candidates. "
             f"Space=not a swap, S=split here, Esc=exit."
@@ -1477,6 +1486,7 @@ class LabelerWindow(QMainWindow):
             )
             self.statusBar().showMessage(msg)
             self.review_mode = False
+            self._enable_review_shortcuts(False)
             self.preview_label.clear()
             self.review_info.clear()
             self.df.to_csv(self.out_csv_path, index=False)
@@ -1488,8 +1498,8 @@ class LabelerWindow(QMainWindow):
 
     def _show_review_pair(self, item):
         curr_idx = item["curr_idx"]
-        # Repoint the main view to the current row so the box shown is the one
-        # after the jump.
+        # Point the main view at the current row if possible; if the frame
+        # file is missing we still want to keep the review going.
         self._show_index(curr_idx)
 
         composite = self._compose_pair_crops(item["prev_idx"], curr_idx)
@@ -1510,7 +1520,7 @@ class LabelerWindow(QMainWindow):
             f"area×{item['area_ratio']:.2f} | "
             f"score {item['score']:.1f}"
         )
-        self.true_id_entry.setText(str(self.df.at[curr_idx, "true_id"]))
+        self.true_id_entry.setText(str(self.df.iloc[curr_idx]["true_id"]))
         self.entry.clear()
 
     def _compose_pair_crops(self, prev_idx, curr_idx):
@@ -1562,6 +1572,7 @@ class LabelerWindow(QMainWindow):
         if not self.review_mode:
             return
         self.review_mode = False
+        self._enable_review_shortcuts(False)
         self.preview_label.clear()
         self.review_info.clear()
         self.statusBar().showMessage("Exited review mode.")
@@ -1603,6 +1614,7 @@ class LabelerWindow(QMainWindow):
             f"Exiting review to label the new segment."
         )
         self.review_mode = False
+        self._enable_review_shortcuts(False)
         self.preview_label.clear()
         self.review_info.clear()
         self._show_index(curr_idx)  # user types the species and hits Enter
