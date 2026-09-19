@@ -17,10 +17,7 @@ Features:
     every unlabeled row sharing that Track ID.
   • A `true_id` identity column: rows sharing a `true_id` are the same
     physical fish. Merge broken tracks by editing True ID in the UI;
-    split switched tracks via the Split-here button or automatic review.
-  • Automatic detection of probable ID swaps using per-track motion /
-    size discontinuity scoring, plus a review pass that walks the user
-    through the top candidates with side-by-side crop previews.
+    split switched tracks via the Split-here button.
   • Auto-suggestion from the current multi-head model with softmax
     confidences shown in the UI. Press Enter on an empty field to accept,
     type a name to override.
@@ -44,6 +41,14 @@ Features:
   • Family resolution uses the same layered resolver as train.py: checklist,
     optional secondary CSV, then GBIF, with a shared on-disk cache so the
     second run is offline-instant.
+
+Note:
+  Probable ID-swap detection, correction, and swap-frame recovery are
+  handled by a separate companion script, check_id_swaps.py. That script
+  scans a tracking CSV for motion/size discontinuities, splits swapped
+  segments onto a fresh true_id, and pulls the swap frame out of the
+  source video (offline) so the normal labeling pass here can pick it up.
+  Run it before — or between sessions of — this tool.
 
 Usage:
     python track_cleaning.py
@@ -395,126 +400,6 @@ def compute_class_weights(labels, num_classes):
         weights.append(total / (num_classes * max(c, 1)))
     w = torch.tensor(weights, dtype=torch.float32, device=DEVICE)
     return torch.clamp(w, max=10.0)
-
-
-# ==========================================
-# 3b. Track discontinuity detection (probable ID swaps)
-# ==========================================
-def _box_center(row):
-    return ((row["x1"] + row["x2"]) / 2.0, (row["y1"] + row["y2"]) / 2.0)
-
-
-def detect_track_discontinuities(df, *, velocity_window=5, max_pairs=500):
-    """
-    For every consecutive-row pair within the same track `id`, compute a
-    continuity score. A high score means the transition looks like a jump —
-    an occlusion-triggered identity swap, a track break, or a merged
-    detection — rather than a fish smoothly continuing to swim.
-
-    Returns a DataFrame sorted by score desc, capped at `max_pairs`, with
-    columns: id, prev_idx, curr_idx, prev_frame, curr_frame, frame_gap,
-    pos_jump_pf, vel_angle_deg, area_ratio, speed_ratio, score,
-    true_id_prev, true_id_curr.
-    """
-    rows = []
-    for track_id, grp in df.groupby("id", sort=False):
-        grp = grp.sort_values("frame")
-        idxs = grp.index.tolist()
-        if len(idxs) < 2:
-            continue
-
-        cxs, cys, areas, frames = [], [], [], []
-        for i in idxs:
-            r = df.loc[i]
-            cx, cy = _box_center(r)
-            cxs.append(cx)
-            cys.append(cy)
-            areas.append(max(1.0, float((r["x2"] - r["x1"]) * (r["y2"] - r["y1"]))))
-            frames.append(int(r["frame"]))
-
-        for k in range(1, len(idxs)):
-            prev_idx, curr_idx = idxs[k - 1], idxs[k]
-            f_prev, f_curr = frames[k - 1], frames[k]
-            f_gap = max(1, f_curr - f_prev)
-            dx = cxs[k] - cxs[k - 1]
-            dy = cys[k] - cys[k - 1]
-            dist = (dx * dx + dy * dy) ** 0.5
-            pos_jump_pf = dist / f_gap
-
-            # Recent velocity from up to `velocity_window` prior transitions.
-            lo = max(0, k - velocity_window)
-            hist = []
-            for j in range(lo + 1, k):
-                fj = max(1, frames[j] - frames[j - 1])
-                hx = (cxs[j] - cxs[j - 1]) / fj
-                hy = (cys[j] - cys[j - 1]) / fj
-                hist.append((hx, hy))
-            if hist:
-                vx_prev = sum(h[0] for h in hist) / len(hist)
-                vy_prev = sum(h[1] for h in hist) / len(hist)
-            else:
-                vx_prev = vy_prev = 0.0
-
-            vx_curr = dx / f_gap
-            vy_curr = dy / f_gap
-
-            # Direction change (deg, 0 = perfectly consistent).
-            n1 = (vx_prev**2 + vy_prev**2) ** 0.5
-            n2 = (vx_curr**2 + vy_curr**2) ** 0.5
-            if n1 > 1e-6 and n2 > 1e-6:
-                cos_a = max(
-                    -1.0, min(1.0, (vx_prev * vx_curr + vy_prev * vy_curr) / (n1 * n2))
-                )
-                vel_angle_deg = float(np.degrees(np.arccos(cos_a)))
-            else:
-                vel_angle_deg = 0.0
-
-            area_ratio = areas[k] / areas[k - 1]
-            speed_ratio = n2 / (n1 + 1e-6)
-
-            jump_score = pos_jump_pf
-            angle_score = vel_angle_deg / 180.0
-            area_score = abs(float(np.log(max(area_ratio, 1e-6))))
-            speed_score = (
-                abs(float(np.log(max(speed_ratio, 1e-6)))) if n1 > 1e-3 else 0.0
-            )
-            # Longer gaps are riskier: identity may have been re-acquired on a
-            # different fish after an occlusion. Small weight, but it lifts
-            # long-gap candidates above trivially small jitter.
-            gap_score = float(np.log1p(f_gap)) / 5.0
-
-            score = (
-                1.0 * jump_score
-                + 15.0 * angle_score
-                + 8.0 * area_score
-                + 4.0 * speed_score
-                + 5.0 * gap_score
-            )
-
-            rows.append(
-                {
-                    "id": int(track_id),
-                    "prev_idx": int(prev_idx),
-                    "curr_idx": int(curr_idx),
-                    "prev_frame": int(f_prev),
-                    "curr_frame": int(f_curr),
-                    "frame_gap": int(f_gap),
-                    "pos_jump_pf": float(pos_jump_pf),
-                    "vel_angle_deg": float(vel_angle_deg),
-                    "area_ratio": float(area_ratio),
-                    "speed_ratio": float(speed_ratio),
-                    "true_id_prev": df.at[prev_idx, "true_id"],
-                    "true_id_curr": df.at[curr_idx, "true_id"],
-                    "score": float(score),
-                }
-            )
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    return (
-        out.sort_values("score", ascending=False).head(max_pairs).reset_index(drop=True)
-    )
 
 
 # ==========================================
@@ -1080,12 +965,6 @@ class LabelerWindow(QMainWindow):
         self._track_row_indices = []
         self._track_pos = 0
 
-        # review mode state
-        self.review_queue = []
-        self.review_pos = -1
-        self.review_mode = False
-        self.review_stats = {"n": 0, "splits": 0, "merges": 0}
-
         self._build_ui()
         QTimer.singleShot(0, self._advance)
 
@@ -1108,25 +987,6 @@ class LabelerWindow(QMainWindow):
         self.reco_label = QLabel("")
         self.reco_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         layout.addWidget(self.reco_label)
-
-        # Review-mode preview strip (hidden unless a candidate is active).
-        self.preview_label = QLabel("")
-        self.preview_label.setMinimumHeight(220)
-        self.preview_label.setStyleSheet("background:#111; color:#eee;")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.preview_label)
-
-        # Review-mode status + button row.
-        review_row = QHBoxLayout()
-        self.review_btn = QPushButton("🔎 Review suspect ID swaps")
-        self.review_btn.setToolTip("Ctrl+R — scan tracks for probable identity swaps")
-        self.review_btn.clicked.connect(self._enter_review_mode)
-        review_row.addWidget(self.review_btn)
-
-        self.review_info = QLabel("")
-        self.review_info.setStyleSheet("font-size: 12px; color:#ccc;")
-        review_row.addWidget(self.review_info, stretch=1)
-        layout.addLayout(review_row)
 
         # Species entry.
         input_row = QHBoxLayout()
@@ -1179,8 +1039,7 @@ class LabelerWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage(
-            "Ready. Type a species name, leave blank to accept, 'exit' to finish. "
-            "Ctrl+R reviews suspect ID swaps."
+            "Ready. Type a species name, leave blank to accept, 'exit' to finish."
         )
 
         # Shortcuts
@@ -1196,21 +1055,6 @@ class LabelerWindow(QMainWindow):
         )
         QShortcut(QKeySequence("Alt+n"), self, activated=self._assign_new_id)
         QShortcut(QKeySequence("Alt+s"), self, activated=self._split_here)
-        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._enter_review_mode)
-
-        # Review-only shortcuts. Disabled by default so they don't swallow
-        # Space / Shift+S while the user is typing a species name.
-        self._review_shortcuts = [
-            QShortcut(QKeySequence("Space"), self, activated=self._review_skip),
-            QShortcut(QKeySequence("S"), self, activated=self._review_split),
-            QShortcut(QKeySequence("Escape"), self, activated=self._review_exit),
-        ]
-        for sc in self._review_shortcuts:
-            sc.setEnabled(False)
-
-    def _enable_review_shortcuts(self, enabled: bool):
-        for sc in self._review_shortcuts:
-            sc.setEnabled(enabled)
 
     # ---------- image handling ----------
     def _set_image(self, bgr):
@@ -1221,6 +1065,15 @@ class LabelerWindow(QMainWindow):
         self.image_view.set_pixmap(self._current_pixmap)
 
     # ---------- navigation ----------
+    def _load_frame_bgr(self, frame_num):
+        """Return the full BGR frame image for `frame_num`, or (None, None)."""
+        img_path = locate_frame_path(self.frame_index, frame_num)
+        if img_path and os.path.exists(img_path):
+            img = cv2.imread(img_path)
+            if img is not None:
+                return img, img_path
+        return None, None
+
     def _advance(self):
         """Show the first unlabeled row whose frame is loadable."""
         for i in range(len(self.df)):
@@ -1233,11 +1086,7 @@ class LabelerWindow(QMainWindow):
     def _show_index(self, idx):
         """Display row `idx`. Returns True on success, False on missing/unreadable frame."""
         row = self.df.iloc[idx]
-        img_path = locate_frame_path(self.frame_index, row["frame"])
-        if not img_path or not os.path.exists(img_path):
-            return False
-
-        img = cv2.imread(img_path)
+        img, img_path = self._load_frame_bgr(row["frame"])
         if img is None:
             return False
 
@@ -1295,8 +1144,9 @@ class LabelerWindow(QMainWindow):
         )
         self._set_image(display)
 
+        frame_src = os.path.basename(img_path) if img_path else "(decoded from video)"
         self.frame_label.setText(
-            f"Index: {idx} | Frame: {os.path.basename(img_path)} | "
+            f"Index: {idx} | Frame: {frame_src} | "
             f"Track ID: {int(row['id'])} | True ID: {row['true_id']} | "
             f"Frame {self._track_pos + 1}/{len(track_idxs)}"
         )
@@ -1446,178 +1296,6 @@ class LabelerWindow(QMainWindow):
             self._start_retrain()
         else:
             self._advance()
-
-    # ---------- review mode ----------
-    def _enter_review_mode(self):
-        if self.review_mode:
-            return
-        self.statusBar().showMessage("🔎 Scanning tracks for suspicious jumps…")
-        QApplication.processEvents()
-
-        disc = detect_track_discontinuities(self.df, max_pairs=500)
-        if disc.empty:
-            self.statusBar().showMessage("No candidates found.")
-            return
-
-        # Only surface pairs whose two sides still share the same true_id.
-        disc = disc[disc["true_id_prev"] == disc["true_id_curr"]].reset_index(drop=True)
-        if disc.empty:
-            self.statusBar().showMessage("No unresolved candidates.")
-            return
-
-        self.review_queue = disc.to_dict("records")
-        self.review_pos = -1
-        self.review_mode = True
-        self.review_stats = {"n": 0, "splits": 0, "merges": 0}
-        self._enable_review_shortcuts(True)
-        self.statusBar().showMessage(
-            f"🔎 {len(self.review_queue)} candidates. "
-            f"Space=not a swap, S=split here, Esc=exit."
-        )
-        self._next_review()
-
-    def _next_review(self):
-        self.review_pos += 1
-        if self.review_pos >= len(self.review_queue):
-            msg = (
-                f"✅ Review complete — {self.review_stats['n']} checked, "
-                f"{self.review_stats['splits']} split, "
-                f"{self.review_stats['merges']} merged."
-            )
-            self.statusBar().showMessage(msg)
-            self.review_mode = False
-            self._enable_review_shortcuts(False)
-            self.preview_label.clear()
-            self.review_info.clear()
-            self.df.to_csv(self.out_csv_path, index=False)
-            self._advance()
-            return
-
-        item = self.review_queue[self.review_pos]
-        self._show_review_pair(item)
-
-    def _show_review_pair(self, item):
-        curr_idx = item["curr_idx"]
-        # Point the main view at the current row if possible; if the frame
-        # file is missing we still want to keep the review going.
-        self._show_index(curr_idx)
-
-        composite = self._compose_pair_crops(item["prev_idx"], curr_idx)
-        if composite is not None:
-            rgb = cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb.shape
-            qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-            self.preview_label.setPixmap(QPixmap.fromImage(qimg))
-        else:
-            self.preview_label.setText("(no preview)")
-
-        self.review_info.setText(
-            f"[{self.review_pos + 1}/{len(self.review_queue)}] "
-            f"id={item['id']} frames {item['prev_frame']}→{item['curr_frame']} "
-            f"(gap {item['frame_gap']}) | "
-            f"jump {item['pos_jump_pf']:.2f} px/f | "
-            f"Δdir {item['vel_angle_deg']:.0f}° | "
-            f"area×{item['area_ratio']:.2f} | "
-            f"score {item['score']:.1f}"
-        )
-        self.true_id_entry.setText(str(self.df.iloc[curr_idx]["true_id"]))
-        self.entry.clear()
-
-    def _compose_pair_crops(self, prev_idx, curr_idx):
-        """Return a BGR image with the prev-frame crop beside the curr-frame crop."""
-
-        def _load_crop(idx):
-            r = self.df.iloc[idx]
-            img_path = locate_frame_path(self.frame_index, r["frame"])
-            if not img_path:
-                return None
-            img = cv2.imread(img_path)
-            if img is None:
-                return None
-            x1, y1, x2, y2 = int(r["x1"]), int(r["y1"]), int(r["x2"]), int(r["y2"])
-            crop = img[y1:y2, x1:x2]
-            return crop if crop.size else None
-
-        prev_crop = _load_crop(prev_idx)
-        curr_crop = _load_crop(curr_idx)
-        if prev_crop is None and curr_crop is None:
-            return None
-
-        H = 260
-
-        def _fit(img):
-            h, w = img.shape[:2]
-            s = H / max(h, 1)
-            return cv2.resize(img, (max(1, int(w * s)), H))
-
-        tiles = []
-        for crop, tag in ((prev_crop, "PREV"), (curr_crop, "CURR")):
-            if crop is None:
-                tiles.append(np.full((H, 120, 3), 40, dtype=np.uint8))
-                continue
-            t = _fit(crop)
-            cv2.putText(t, tag, (5, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            tiles.append(t)
-
-        sep = np.full((H, 20, 3), 90, dtype=np.uint8)
-        return np.hstack([tiles[0], sep, tiles[1]])
-
-    def _review_skip(self):
-        if not self.review_mode:
-            return
-        self.review_stats["n"] += 1
-        self._next_review()
-
-    def _review_exit(self):
-        if not self.review_mode:
-            return
-        self.review_mode = False
-        self._enable_review_shortcuts(False)
-        self.preview_label.clear()
-        self.review_info.clear()
-        self.statusBar().showMessage("Exited review mode.")
-        self._advance()
-
-    def _review_split(self):
-        """User decided the pair IS a swap: new true_id for the current segment."""
-        if not self.review_mode or self.review_pos < 0:
-            return
-        item = self.review_queue[self.review_pos]
-        curr_idx = item["curr_idx"]
-
-        track_id = self.df.at[curr_idx, "id"]
-        old_true = self.df.at[curr_idx, "true_id"]
-        curr_frm = self.df.at[curr_idx, "frame"]
-        new_true = self._next_true_id()
-
-        mask = (
-            (self.df["id"] == track_id)
-            & (self.df["true_id"] == old_true)
-            & (self.df["frame"] >= curr_frm)
-        )
-        n = int(mask.sum())
-        if n == 0:
-            self._next_review()
-            return
-
-        self.df.loc[mask, "true_id"] = new_true
-        # Clear existing labels so the new segment gets relabeled with the
-        # correct species on the next pass.
-        for col in ("assigned_species", "assigned_genus", "assigned_family"):
-            self.df.loc[mask, col] = pd.NA
-
-        self.review_stats["n"] += 1
-        self.review_stats["splits"] += 1
-        self.df.to_csv(self.out_csv_path, index=False)
-        self.statusBar().showMessage(
-            f"✂ Split {n} rows at frame {curr_frm} → true_id {new_true}. "
-            f"Exiting review to label the new segment."
-        )
-        self.review_mode = False
-        self._enable_review_shortcuts(False)
-        self.preview_label.clear()
-        self.review_info.clear()
-        self._show_index(curr_idx)  # user types the species and hits Enter
 
     # ---------- retraining ----------
     def _start_retrain(self):
@@ -1777,7 +1455,10 @@ def execute_pipeline():
     print("  ➔ Leave blank to accept the auto-suggestion.")
     print("  ➔ Edit 'True ID' to merge a broken track into an existing fish.")
     print("  ➔ Press 'Split here' to start a new identity at the current frame.")
-    print("  ➔ Ctrl+R reviews probable ID swaps automatically.")
+    print(
+        "  ➔ For probable ID swaps, run check_id_swaps.py against the source "
+        "video first; it will split the track and backfill the swap frame."
+    )
     print("  ➔ Type 'exit' (or close the window) to retrain & save.")
     print("=======================================================\n")
 
