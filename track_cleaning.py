@@ -34,6 +34,11 @@ Features:
     QThread worker so the UI stays responsive and streams epoch/loss
     progress to the status bar. Label-map indices are preserved across
     retrains, so trained head rows are never silently reassigned.
+  • Durable checkpointing: label maps are persisted to a JSON sidecar
+    (independent of the .pth) and every save rotates the previous
+    generation into ./models/checkpoints/backups/ before overwriting.
+    Writes are atomic (tmp + fsync + os.replace) so a crash mid-save
+    cannot corrupt the live checkpoint.
   • Labeled CSV is flushed at every milestone and on exit, preserving the
     input's subfolder structure under ./output/tracks/.
   • Family resolution uses the same layered resolver as train.py: checklist,
@@ -58,15 +63,19 @@ Outputs:
     ./output/tracks/...           Labeled CSV, mirroring the annotated_videos
                                   subfolder layout of the input.
     ./output/labeled_fish_crops/  Per-species crop folders used as the training set.
-    ./models/checkpoints/         Multi-head checkpoint (fish-classifier-1.pth).
+    ./models/checkpoints/         Multi-head checkpoint (fish-classifier-1.pth)
+                                  plus its label-map sidecar and rotated backups.
 
 Requires:
     pip install PySide6
 """
 
 import argparse
+import json
 import os
+import shutil
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -111,6 +120,9 @@ from taxonomy import TaxonomyResolver, canonical_species
 OUTPUT_CROP_DIR = "./output/labeled_fish_crops"
 CHECKPOINT_DIR = "./models/checkpoints"
 MULTIHEAD_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "fish-classifier-1.pth")
+LABEL_MAP_PATH = os.path.join(CHECKPOINT_DIR, "fish-classifier-labelmaps.json")
+BACKUP_DIR = os.path.join(CHECKPOINT_DIR, "backups")
+KEEP_BACKUPS = 10
 BACKBONE_PATH = "./models/fish-classifier-0.pth"
 CSV_OUT = "./output/tracks"
 DEFAULT_GBIF_CACHE = "./output/.gbif_cache.json"
@@ -508,6 +520,22 @@ def detect_track_discontinuities(df, *, velocity_window=5, max_pairs=500):
 # ==========================================
 # 4. Retraining  (runs on a worker thread)
 # ==========================================
+def _assert_no_class_shrink(prev, new, name):
+    """
+    Belt-and-suspenders guard: a retrain must never drop a class that the
+    previous label map already knew about.  If this fires, the caller passed
+    an empty/incomplete prev_* map and a head would silently be truncated.
+    """
+    if not prev:
+        return
+    missing = set(prev) - set(new)
+    if missing:
+        raise RuntimeError(
+            f"{name} label map lost {len(missing)} classes during retrain "
+            f"(e.g. {sorted(missing)[:5]}). Refusing to shrink the head."
+        )
+
+
 def retrain(
     model,
     resolver,
@@ -525,6 +553,10 @@ def retrain(
     set never reshuffles the head weights.  Samples whose family is
     'Unknown_Family' are excluded from the family loss — the head still has
     a slot for that class, but it's never trained to predict it.
+
+    NOTE: model.update_heads() must *grow* the existing Linear layers in
+    place (preserving weights for already-known indices) rather than
+    rebuilding them.  See model.py for the corresponding patch.
     """
     sp_to_idx, gn_to_idx, fa_to_idx = build_label_maps(
         OUTPUT_CROP_DIR,
@@ -533,6 +565,12 @@ def retrain(
         prev_gn=prev_gn,
         prev_fa=prev_fa,
     )
+
+    # Refuse to proceed if anything vanished from the historical maps.
+    _assert_no_class_shrink(prev_sp or {}, sp_to_idx, "species")
+    _assert_no_class_shrink(prev_gn or {}, gn_to_idx, "genus")
+    _assert_no_class_shrink(prev_fa or {}, fa_to_idx, "family")
+
     n_sp, n_gn, n_fa = len(sp_to_idx), len(gn_to_idx), len(fa_to_idx)
 
     if min(n_sp, n_gn, n_fa) < 2:
@@ -610,9 +648,100 @@ def retrain(
     return sp_to_idx, gn_to_idx, fa_to_idx
 
 
+# ==========================================
+# 4a. Durable, atomic checkpoint + label-map persistence
+# ==========================================
+def _atomic_torch_save(obj, path):
+    """Write `obj` to `path` atomically: tmp file, fsync, then os.replace."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    torch.save(obj, tmp)
+    # fsync so a power loss between replace and flush can't truncate the file
+    with open(tmp, "rb") as fh:
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _atomic_json_save(obj, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _rotate_backups(timestamp):
+    """
+    Snapshot the current live checkpoint + label-map into backups/ under a
+    shared timestamp, then prune to KEEP_BACKUPS generations.
+    """
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    for src, suffix in (
+        (MULTIHEAD_CHECKPOINT, "pth"),
+        (LABEL_MAP_PATH, "labelmaps.json"),
+    ):
+        if os.path.exists(src):
+            dst = os.path.join(BACKUP_DIR, f"{timestamp}.{suffix}")
+            shutil.copy2(src, dst)
+
+    generations = sorted({f.split(".", 1)[0] for f in os.listdir(BACKUP_DIR)})
+    for old in generations[:-KEEP_BACKUPS]:
+        for suffix in ("pth", "labelmaps.json"):
+            p = os.path.join(BACKUP_DIR, f"{old}.{suffix}")
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+def save_label_maps(sp_to_idx, gn_to_idx, fa_to_idx):
+    """Persist the label maps independent of the .pth, so a checkpoint
+    without sp_to_idx (e.g. one produced by train.py) can still be
+    reconstructed into a full historical map."""
+    _atomic_json_save(
+        {
+            "sp_to_idx": sp_to_idx,
+            "gn_to_idx": gn_to_idx,
+            "fa_to_idx": fa_to_idx,
+        },
+        LABEL_MAP_PATH,
+    )
+
+
+def load_label_maps():
+    """Returns ({}, {}, {}) on any failure — missing file, corrupt JSON, etc."""
+    if not os.path.exists(LABEL_MAP_PATH):
+        return {}, {}, {}
+    try:
+        with open(LABEL_MAP_PATH, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}, {}, {}
+    return (
+        d.get("sp_to_idx", {}) or {},
+        d.get("gn_to_idx", {}) or {},
+        d.get("fa_to_idx", {}) or {},
+    )
+
+
 def save_checkpoint(model, sp_to_idx, gn_to_idx, fa_to_idx):
+    """
+    Rotate backups, then atomically write the label-map sidecar and the
+    checkpoint itself.  Order matters: the sidecar is written first, so if
+    the process dies between the two writes we still have a consistent
+    map that can repair the (older) .pth on next load.
+    """
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    torch.save(
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    _rotate_backups(timestamp)
+
+    save_label_maps(sp_to_idx, gn_to_idx, fa_to_idx)
+
+    _atomic_torch_save(
         {
             "model_state": model.state_dict(),
             "sp_to_idx": sp_to_idx,
@@ -624,7 +753,7 @@ def save_checkpoint(model, sp_to_idx, gn_to_idx, fa_to_idx):
         },
         MULTIHEAD_CHECKPOINT,
     )
-    print(f" 💾 Checkpoint saved to {MULTIHEAD_CHECKPOINT}")
+    print(f" 💾 Checkpoint saved to {MULTIHEAD_CHECKPOINT} (backup: {timestamp})")
 
 
 # ==========================================
@@ -650,6 +779,19 @@ def _infer_head_sizes_from_state_dict(state_dict):
     return n_sp, n_gn, n_fa
 
 
+def _merge_label_maps(primary, sidecar):
+    """
+    Union of two label maps.  `sidecar` wins on conflicts (it is the
+    authoritative historical record); primary supplies anything the
+    sidecar lacks (e.g. a checkpoint that was saved by train.py and never
+    touched by this session).
+    """
+    out = dict(sidecar or {})
+    for k, v in (primary or {}).items():
+        out.setdefault(k, v)
+    return out
+
+
 def build_or_load_model(backbone_path=None):
     if os.path.exists(MULTIHEAD_CHECKPOINT):
         ckpt = torch.load(MULTIHEAD_CHECKPOINT, map_location=DEVICE)
@@ -659,11 +801,17 @@ def build_or_load_model(backbone_path=None):
         n_gn = ckpt.get("num_genera")
         n_fa = ckpt.get("num_families")
 
-        sp_to_idx = ckpt.get("sp_to_idx") or {}
-        gn_to_idx = ckpt.get("gn_to_idx") or {}
-        fa_to_idx = ckpt.get("fa_to_idx") or {}
+        ckpt_sp = ckpt.get("sp_to_idx") or {}
+        ckpt_gn = ckpt.get("gn_to_idx") or {}
+        ckpt_fa = ckpt.get("fa_to_idx") or {}
 
-        # Fallback: explicit keys → label-map lengths → head tensor shapes.
+        # --- Merge in the sidecar so a checkpoint without maps is repaired ---
+        sidecar_sp, sidecar_gn, sidecar_fa = load_label_maps()
+        sp_to_idx = _merge_label_maps(ckpt_sp, sidecar_sp)
+        gn_to_idx = _merge_label_maps(ckpt_gn, sidecar_gn)
+        fa_to_idx = _merge_label_maps(ckpt_fa, sidecar_fa)
+
+        # Fallback: explicit keys → merged label-map lengths → tensor shapes.
         if n_sp is None and sp_to_idx:
             n_sp = len(sp_to_idx)
         if n_gn is None and gn_to_idx:
@@ -694,7 +842,8 @@ def build_or_load_model(backbone_path=None):
         model.eval()
         print(
             f" ➔ Loaded checkpoint {MULTIHEAD_CHECKPOINT} "
-            f"(sp={n_sp}, gn={n_gn}, fa={n_fa})"
+            f"(sp={n_sp}, gn={n_gn}, fa={n_fa}; "
+            f"label-map sp={len(sp_to_idx)} gn={len(gn_to_idx)} fa={len(fa_to_idx)})"
         )
         return model, sp_to_idx, gn_to_idx, fa_to_idx, True
 
@@ -717,7 +866,10 @@ def build_or_load_model(backbone_path=None):
         ).to(DEVICE)
         print(" ➔ Initialized cold multi-head model.")
 
-    return model, {}, {}, {}, False
+    # Even on a cold start, recover any label maps that exist from a prior
+    # session whose .pth has since been deleted.
+    sidecar_sp, sidecar_gn, sidecar_fa = load_label_maps()
+    return model, sidecar_sp, sidecar_gn, sidecar_fa, False
 
 
 def predict(model, img_tensor, sp_inv, gn_inv, fa_inv):
@@ -1573,6 +1725,9 @@ def execute_pipeline():
     print(f"Checklist:          {checklist_path}")
     print(f"Frames folder:      {root_data_dir}")
     print(f"GBIF cache:         {args.gbif_cache}")
+    print(f"Checkpoint:         {MULTIHEAD_CHECKPOINT}")
+    print(f"Label maps:         {LABEL_MAP_PATH}")
+    print(f"Backups:            {BACKUP_DIR}")
 
     os.makedirs(OUTPUT_CROP_DIR, exist_ok=True)
 
