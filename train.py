@@ -3,35 +3,54 @@ train.py
 
 Pretrain a TaxonomicMultiHead model on reference imagery (GBIF /
 iNaturalist folders from download_images.py, or local copies of FishWIO /
-WildFish / Fish4Knowledge arranged as one folder per species).
+WildFish / Fish4Knowledge arranged as one folder per species) **plus** any
+labeled crop corpus produced by track_cleaning.py.
+
+Multiple data sources are supported via repeated --data-dir flags.  Every
+directory is expected to have the same layout (one subfolder per species,
+images inside), and all of them are scanned and merged into a single
+training set with one unified label map.  Example:
+
+    python train.py \
+        --data-dir ./reference_images \
+        --data-dir ./output/labeled_fish_crops \
+        --checklist andaman_checklist.csv \
+        --epochs 15 --out models/checkpoints/fish-classifier-1.pth
 
 Produces a checkpoint that is directly loadable by track_cleaning.py: same
 state_dict format, same label-map schema, same three-head architecture.
-The active-learning loop then refines those heads on user-confirmed crops.
+The label-map JSON sidecar (fish-classifier-labelmaps.json) is written
+alongside the checkpoint so track_cleaning.py can load class indices
+without having to re-derive them.
 
 Family resolution is layered (see taxonomy.py): Andaman checklist first,
 optional secondary CSV second, then GBIF.  GBIF is queried at most once
 per genus per run and cached on disk, so the second run is offline and
-instant.  A prewarm pass resolves every genus before image scanning
-starts, so the file walk never interleaves with network I/O.
+instant.  A prewarm pass resolves every genus across every data source
+before image scanning starts, so the file walk never interleaves with
+network I/O.
 
 Species folder names are normalized via taxonomy.canonical_species, so
 'Lutjanus decussatus', 'Lutjanus_decussatus', and 'lutjanus_decussatus'
-all map to the same class.
+all map to the same class — including across different --data-dir roots.
 
 Usage:
     python train.py \
         --data-dir ./reference_images \
+        [--data-dir ./output/labeled_fish_crops] \
         --checklist andaman_checklist.csv \
         [--secondary-taxonomy ./output/fishbase_genera.csv] \
         [--gbif-cache ./output/.gbif_cache.json] \
         --epochs 15 --batch-size 32 \
         --out models/checkpoints/fish-classifier-1.pth \
+        [--label-map-out models/checkpoints/fish-classifier-labelmaps.json] \
         [--amp] [--backbone /path/to/fish-classifier-0.pth]
 """
 
 import argparse
+import json
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -85,7 +104,7 @@ def collect_folder_names(root_dir):
     """Return sorted list of immediate subdirectory names under root_dir."""
     root = Path(root_dir)
     if not root.is_dir():
-        raise SystemExit(f"Reference directory not found: {root}")
+        raise SystemExit(f"Data directory not found: {root}")
     return [d.name for d in sorted(root.iterdir()) if d.is_dir()]
 
 
@@ -94,7 +113,8 @@ def prewarm_gbif_for_missing_genera(folder_names, resolver):
     Derive a genus from each folder name the same way resolve() would,
     filter out those already covered by the checklist or cache, and prewarm
     GBIF for the rest.  Runs before image scanning so training never blocks
-    on network I/O.
+    on network I/O.  Folder names may come from any number of data dirs —
+    duplicates are collapsed by the set.
     """
     missing = set()
     for name in folder_names:
@@ -118,19 +138,23 @@ def prewarm_gbif_for_missing_genera(folder_names, resolver):
     resolver.prewarm(missing, batch_log_every=25)
 
 
-def scan_reference_folders(root_dir, resolver):
+def scan_one_data_dir(root_dir, resolver):
     """
-    Walk root_dir (one subfolder per species), normalize folder names via
-    canonical_species, and derive the three label maps.
+    Walk a single data directory (one subfolder per species), normalize
+    folder names via canonical_species, and return a flat list of
+    (img_path, sp_key, genus, family) records.
 
-    Returns (samples, sp_to_idx, gn_to_idx, fa_to_idx) where samples is a
-    list of (img_path, sp_idx, gn_idx, fa_idx).
+    Raises SystemExit only if `root_dir` itself is missing — an individual
+    species folder with no images is silently skipped, because the crop
+    corpus can legitimately contain species the model has never seen and
+    empty folders from a crashed session.
     """
     root = Path(root_dir)
-    sp_set, gn_set, fa_set = set(), set(), set()
-    records = []  # (path, species_key, genus, family)
-    skipped_dirs = 0
+    if not root.is_dir():
+        raise SystemExit(f"Data directory not found: {root}")
 
+    records = []
+    skipped_dirs = 0
     for d in sorted(root.iterdir()):
         if not d.is_dir():
             continue
@@ -142,18 +166,40 @@ def scan_reference_folders(root_dir, resolver):
         if not imgs:
             skipped_dirs += 1
             continue
-        sp_set.add(sp_key)
-        gn_set.add(genus)
-        fa_set.add(family)
         for p in imgs:
             records.append((str(p), sp_key, genus, family))
 
+    return records, skipped_dirs
+
+
+def scan_all_data_dirs(data_dirs, resolver):
+    """
+    Merge every --data-dir root into a single (samples, sp_to_idx, gn_to_idx,
+    fa_to_idx) tuple.  Species with the same canonical name across two roots
+    collapse into one class; anything new in the crop corpus that isn't in
+    the reference set becomes an additional class.
+
+    Returns (samples, sp_to_idx, gn_to_idx, fa_to_idx).
+    """
+    all_records = []
+    for d in data_dirs:
+        recs, skipped = scan_one_data_dir(d, resolver)
+        note = f" ({skipped} empty/unresolvable folder(s) skipped)" if skipped else ""
+        print(f"   {d}: {len(recs)} image(s){note}")
+        all_records.extend(recs)
+
+    if not all_records:
+        raise SystemExit("No images found across any --data-dir.")
+
+    sp_set = {r[1] for r in all_records}
+    gn_set = {r[2] for r in all_records}
+    fa_set = {r[3] for r in all_records}
+
     if len(sp_set) < 2:
         raise SystemExit(
-            f"Need ≥2 non-empty species folders under {root}; found {len(sp_set)}."
+            f"Need ≥2 distinct species across all --data-dir roots; "
+            f"found {len(sp_set)}."
         )
-    if skipped_dirs:
-        print(f" ⚠ Skipped {skipped_dirs} folder(s) with no images or empty names.")
 
     sp_to_idx = {s: i for i, s in enumerate(sorted(sp_set))}
     gn_to_idx = {g: i for i, g in enumerate(sorted(gn_set))}
@@ -161,7 +207,7 @@ def scan_reference_folders(root_dir, resolver):
 
     samples = [
         (path, sp_to_idx[sp], gn_to_idx[gn], fa_to_idx[fa])
-        for path, sp, gn, fa in records
+        for path, sp, gn, fa in all_records
     ]
     return samples, sp_to_idx, gn_to_idx, fa_to_idx
 
@@ -183,6 +229,46 @@ class MultiHeadFishDataset(Dataset):
             rgb = img.convert("RGB")
             tensor = self.transform(rgb)
         return tensor, sp, gn, fa
+
+
+# ==========================================
+# Split
+# ==========================================
+def stratified_split(samples, val_fraction, seed=42):
+    """
+    Train/val split stratified by species index.
+
+    A plain random split is dangerous once the crop corpus is merged in:
+    a species with only a handful of crops (say three Andaman fish) could
+    otherwise land entirely in train or entirely in val, making the val
+    score either falsely optimistic or meaningless.  Stratifying keeps
+    every species represented in val whenever it has ≥2 samples, and
+    drops rare single-sample species into train only.
+
+    Returns (train_samples, val_samples), both shuffled.
+    """
+    by_species = defaultdict(list)
+    for s in samples:
+        by_species[s[1]].append(s)
+
+    rng = torch.Generator().manual_seed(seed)
+    train, val = [], []
+    for sp_idx in sorted(by_species):
+        items = by_species[sp_idx]
+        perm = torch.randperm(len(items), generator=rng).tolist()
+        shuffled = [items[i] for i in perm]
+        if len(shuffled) == 1:
+            train.extend(shuffled)
+            continue
+        n_val = max(1, int(round(len(shuffled) * val_fraction)))
+        n_val = min(n_val, len(shuffled) - 1)  # always keep ≥1 in train
+        val.extend(shuffled[:n_val])
+        train.extend(shuffled[n_val:])
+
+    # Re-shuffle both sets so batches aren't species-ordered.
+    train_perm = torch.randperm(len(train), generator=rng).tolist()
+    val_perm = torch.randperm(len(val), generator=rng).tolist()
+    return [train[i] for i in train_perm], [val[i] for i in val_perm]
 
 
 # ==========================================
@@ -272,8 +358,8 @@ def save_multhead_checkpoint(
     model, path, sp_to_idx, gn_to_idx, fa_to_idx, n_sp, n_gn, n_fa
 ):
     """
-    Writes the exact format track_cleaning.save_checkpoint produces so the
-    two are interchangeable on disk.
+    Writes the exact format track_cleaning.save_checkpoint used to produce
+    so the two are interchangeable on disk.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save(
@@ -290,17 +376,42 @@ def save_multhead_checkpoint(
     )
 
 
+def save_label_map_json(path, sp_to_idx, gn_to_idx, fa_to_idx):
+    """
+    Persist the label maps as a JSON sidecar next to the checkpoint, in the
+    exact schema track_cleaning.load_label_maps() expects.  Written before
+    training starts so a crash mid-run still leaves a usable map behind.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "sp_to_idx": sp_to_idx,
+                "gn_to_idx": gn_to_idx,
+                "fa_to_idx": fa_to_idx,
+            },
+            fh,
+            indent=2,
+        )
+
+
 # ==========================================
 # Main
 # ==========================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Pretrain a TaxonomicMultiHead fish classifier."
+        description="Pretrain a TaxonomicMultiHead fish classifier. "
+        "Pass --data-dir multiple times to merge reference imagery with a "
+        "track_cleaning.py crop corpus."
     )
     parser.add_argument(
         "--data-dir",
+        action="append",
         required=True,
-        help="Folder of per-species subfolders of reference images.",
+        help="Folder of per-species subfolders of images. May be repeated; "
+        "every root is scanned and merged into one training set. Typical "
+        "use: --data-dir ./reference_images "
+        "--data-dir ./output/labeled_fish_crops",
     )
     parser.add_argument(
         "--checklist",
@@ -328,6 +439,13 @@ def main():
         help="Checkpoint path, loadable directly by track_cleaning.py.",
     )
     parser.add_argument(
+        "--label-map-out",
+        default=None,
+        help="Where to write the JSON label-map sidecar. Defaults to "
+        "fish-classifier-labelmaps.json in the same directory as --out, "
+        "matching what track_cleaning.py loads.",
+    )
+    parser.add_argument(
         "--backbone",
         default=None,
         help="Optional ImageNet-pretrained state_dict to warm-start "
@@ -347,21 +465,24 @@ def main():
     )
 
     # ---------------------------------------------------------------
-    # Pass 1: folder discovery (no I/O per image yet)
+    # Pass 1: folder discovery across every --data-dir root
     # ---------------------------------------------------------------
-    print(f"\n📂 Scanning {args.data_dir}…")
-    folder_names = collect_folder_names(args.data_dir)
-    print(f"   Found {len(folder_names)} species folders.")
+    print(f"\n📂 Scanning {len(args.data_dir)} data source(s)…")
+    all_folder_names = []
+    for d in args.data_dir:
+        names = collect_folder_names(d)
+        print(f"   {d}: {len(names)} species folder(s)")
+        all_folder_names.extend(names)
 
     # ---------------------------------------------------------------
     # Pass 1.5: prewarm GBIF for any genus not already resolved
     # ---------------------------------------------------------------
-    prewarm_gbif_for_missing_genera(folder_names, resolver)
+    prewarm_gbif_for_missing_genera(all_folder_names, resolver)
 
     # ---------------------------------------------------------------
     # Pass 2: build samples now that every genus is resolvable locally
     # ---------------------------------------------------------------
-    samples, sp_to_idx, gn_to_idx, fa_to_idx = scan_reference_folders(
+    samples, sp_to_idx, gn_to_idx, fa_to_idx = scan_all_data_dirs(
         args.data_dir, resolver
     )
     resolver.finalize()
@@ -385,17 +506,26 @@ def main():
     print(f"\nClasses: sp={n_sp}  gn={n_gn}  fa={n_fa}  |  images: {len(samples)}")
 
     # ---------------------------------------------------------------
-    # Train/val split (before dataset wrapping, so indices are disjoint)
+    # Write the label-map sidecar now, before any training happens, so a
+    # crash mid-run still leaves track_cleaning.py something to load.
     # ---------------------------------------------------------------
-    val_size = max(1, int(len(samples) * args.val_fraction))
-    train_size = len(samples) - val_size
-    if train_size < 1:
-        raise SystemExit("Not enough images to split into train/val.")
+    label_map_path = args.label_map_out or os.path.join(
+        os.path.dirname(args.out) or ".",
+        "fish-classifier-labelmaps.json",
+    )
+    save_label_map_json(label_map_path, sp_to_idx, gn_to_idx, fa_to_idx)
+    print(f" 💾 Label maps written to {label_map_path}")
 
-    gen = torch.Generator().manual_seed(42)
-    perm = torch.randperm(len(samples), generator=gen).tolist()
-    train_samples = [samples[i] for i in perm[:train_size]]
-    val_samples = [samples[i] for i in perm[train_size:]]
+    # ---------------------------------------------------------------
+    # Stratified train/val split (species-balanced across both sides)
+    # ---------------------------------------------------------------
+    train_samples, val_samples = stratified_split(samples, args.val_fraction)
+    if not val_samples:
+        raise SystemExit("Stratified split produced an empty val set.")
+    print(
+        f" Split: {len(train_samples)} train / {len(val_samples)} val "
+        f"({len(train_samples)} seen per epoch)"
+    )
 
     train_loader = DataLoader(
         MultiHeadFishDataset(train_samples, TRAIN_TRANSFORM),
@@ -480,6 +610,7 @@ def main():
 
     print(f"\nDone. Best composite val score: {best_val:.3f}")
     print(f"Checkpoint: {args.out}")
+    print(f"Label maps: {label_map_path}")
     print("Loadable directly by track_cleaning.py.")
 
 
