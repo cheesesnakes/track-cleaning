@@ -5,20 +5,19 @@ Active-learning pipeline for Andaman reef fish identification.
 
 Combines CLI/GUI path selection, per-track mass labeling, hierarchical
 multi-head classification (species / genus / family), on-disk crop
-storage, and periodic GPU retraining on a background thread — all
-wrapped in a Qt-based viewer with zoom/pan for fine-grained ID.
+storage, and a Qt-based viewer with zoom/pan for fine-grained ID.
 
 Features:
   • CLI args (-c/-l/-f) with Qt file/folder dialogs as fallback for any
     input not supplied on the command line.
-  • Loads a TaxonomicMultiHead checkpoint (produced by train.py or by a
-    previous session) and refines it in place. Predictions from frame one.
+  • Loads a TaxonomicMultiHead checkpoint (produced by train.py) and uses
+    it to suggest labels from frame one.
   • Label one representative frame per track; the label is propagated to
     every unlabeled row sharing that Track ID.
   • A `true_id` identity column: rows sharing a `true_id` are the same
     physical fish. Merge broken tracks by editing True ID in the UI;
     split switched tracks via the Split-here button.
-  • Auto-suggestion from the current multi-head model with softmax
+  • Auto-suggestion from the loaded multi-head model with softmax
     confidences shown in the UI. Press Enter on an empty field to accept,
     type a name to override.
   • Corrections overwrite cleanly: typing a species for an already-labeled
@@ -35,16 +34,6 @@ Features:
     audit or relabel any row without hunting for its track.
   • Crops of every confirmed label are written to disk under
     ./output/labeled_fish_crops/<species>/ for use as future training data.
-  • Every RETRAIN_INTERVAL confirmations, and once more at session end,
-    the model is retrained on the on-disk crop corpus. Training runs on a
-    QThread worker so the UI stays responsive and streams epoch/loss
-    progress to the status bar. Label-map indices are preserved across
-    retrains, so trained head rows are never silently reassigned.
-  • Durable checkpointing: label maps are persisted to a JSON sidecar
-    (independent of the .pth) and every save rotates the previous
-    generation into ./models/checkpoints/backups/ before overwriting.
-    Writes are atomic (tmp + fsync + os.replace) so a crash mid-save
-    cannot corrupt the live checkpoint.
   • Labeled CSV is flushed at every milestone and on exit, preserving the
     input's subfolder structure under ./output/tracks/.
   • Family resolution uses the same layered resolver as train.py: checklist,
@@ -52,6 +41,10 @@ Features:
     second run is offline-instant.
 
 Note:
+  This script does NOT train or fine-tune models. It only produces labeled
+  CSVs and a crop corpus; use train.py (or a later run of train.py) to fit
+  a new model on the accumulated crops.
+
   Probable ID-swap detection, correction, and swap-frame recovery are
   handled by a separate companion script, check_id_swaps.py. That script
   scans a tracking CSV for motion/size discontinuities, splits swapped
@@ -77,8 +70,10 @@ Outputs:
     ./output/tracks/...           Labeled CSV, mirroring the annotated_videos
                                   subfolder layout of the input.
     ./output/labeled_fish_crops/  Per-species crop folders used as the training set.
-    ./models/checkpoints/         Multi-head checkpoint (fish-classifier-1.pth)
-                                  plus its label-map sidecar and rotated backups.
+
+Reads:
+    ./models/checkpoints/fish-classifier-1.pth         Multi-head checkpoint.
+    ./models/checkpoints/fish-classifier-labelmaps.json  Label-map sidecar.
 
 Requires:
     pip install PySide6
@@ -87,10 +82,7 @@ Requires:
 import argparse
 import json
 import os
-import shutil
 import sys
-import time
-from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -99,11 +91,10 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 try:
-    from PySide6.QtCore import Qt, QThread, Signal, QTimer
+    from PySide6.QtCore import Qt, Signal, QTimer
     from PySide6.QtGui import QImage, QPixmap, QKeySequence, QShortcut, QPainter
     from PySide6.QtWidgets import (
         QApplication,
@@ -135,30 +126,11 @@ OUTPUT_CROP_DIR = "./output/labeled_fish_crops"
 CHECKPOINT_DIR = "./models/checkpoints"
 MULTIHEAD_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "fish-classifier-1.pth")
 LABEL_MAP_PATH = os.path.join(CHECKPOINT_DIR, "fish-classifier-labelmaps.json")
-BACKUP_DIR = os.path.join(CHECKPOINT_DIR, "backups")
-KEEP_BACKUPS = 10
 BACKBONE_PATH = "./models/fish-classifier-0.pth"
 CSV_OUT = "./output/tracks"
 DEFAULT_GBIF_CACHE = "./output/.gbif_cache.json"
 
-RETRAIN_INTERVAL = 150
-BATCH_SIZE = 32
-EPOCHS_PER_RETRAIN = 5
-LR = 1e-4
-LAMBDA_GENUS = 0.3
-LAMBDA_FAMILY = 0.1
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-TRAIN_TRANSFORM = transforms.Compose(
-    [
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
-)
 
 EVAL_TRANSFORM = transforms.Compose(
     [
@@ -327,331 +299,7 @@ def prewarm_resolver_from_existing_crops(resolver):
 
 
 # ==========================================
-# 3. On-disk crop dataset
-# ==========================================
-class FishCropDataset(Dataset):
-    def __init__(self, crop_dir, resolver, sp_to_idx, gn_to_idx, fa_to_idx, transform):
-        self.transform = transform
-        self.samples = []
-        root = Path(crop_dir)
-        if not root.exists():
-            return
-        for species_dir in sorted(root.iterdir()):
-            if not species_dir.is_dir():
-                continue
-            sp_key, genus, family = resolver.resolve(species_dir.name)
-            if (
-                sp_key not in sp_to_idx
-                or genus not in gn_to_idx
-                or family not in fa_to_idx
-            ):
-                continue
-            for img_path in species_dir.glob("*.jpg"):
-                self.samples.append(
-                    (img_path, sp_to_idx[sp_key], gn_to_idx[genus], fa_to_idx[family])
-                )
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        path, sp, gn, fa = self.samples[idx]
-        with Image.open(path) as img:
-            img_rgb = img.convert("RGB")
-            transformed_img = self.transform(img_rgb)
-        return transformed_img, sp, gn, fa
-
-
-def build_label_maps(crop_dir, resolver, prev_sp=None, prev_gn=None, prev_fa=None):
-    """
-    Scan `crop_dir` and produce the three label maps.
-
-    If previous maps are supplied, ALL previously-known classes keep their
-    indices (even those with no crops on disk right now), and new classes
-    found in `crop_dir` are appended alphabetically.  A naive re-sort would
-    reassign species → index between retrains, silently pointing the head
-    weights at the wrong species.
-    """
-    sp_set, gn_set, fa_set = set(), set(), set()
-    root = Path(crop_dir)
-    if root.exists():
-        for species_dir in sorted(root.iterdir()):
-            if not species_dir.is_dir():
-                continue
-            sp_key, genus, family = resolver.resolve(species_dir.name)
-            if not sp_key:
-                continue
-            sp_set.add(sp_key)
-            gn_set.add(genus)
-            fa_set.add(family)
-
-    def stable(existing, keys):
-        existing = existing or {}
-        out = {}
-        for k, i in sorted(existing.items(), key=lambda kv: kv[1]):
-            out[k] = i
-        next_idx = (max(out.values()) + 1) if out else 0
-        for k in sorted(keys):
-            if k not in out:
-                out[k] = next_idx
-                next_idx += 1
-        return out
-
-    return (stable(prev_sp, sp_set), stable(prev_gn, gn_set), stable(prev_fa, fa_set))
-
-
-def compute_class_weights(labels, num_classes):
-    counts = Counter(labels)
-    total = sum(counts.values())
-    weights = []
-    for i in range(num_classes):
-        c = counts.get(i, 1)
-        weights.append(total / (num_classes * max(c, 1)))
-    w = torch.tensor(weights, dtype=torch.float32, device=DEVICE)
-    return torch.clamp(w, max=10.0)
-
-
-# ==========================================
-# 4. Retraining  (runs on a worker thread)
-# ==========================================
-def _assert_no_class_shrink(prev, new, name):
-    """
-    Belt-and-suspenders guard: a retrain must never drop a class that the
-    previous label map already knew about.  If this fires, the caller passed
-    an empty/incomplete prev_* map and a head would silently be truncated.
-    """
-    if not prev:
-        return
-    missing = set(prev) - set(new)
-    if missing:
-        raise RuntimeError(
-            f"{name} label map lost {len(missing)} classes during retrain "
-            f"(e.g. {sorted(missing)[:5]}). Refusing to shrink the head."
-        )
-
-
-def retrain(
-    model,
-    resolver,
-    epochs=EPOCHS_PER_RETRAIN,
-    log=print,
-    prev_sp=None,
-    prev_gn=None,
-    prev_fa=None,
-):
-    """
-    Full retrain pass.  `log` is a callable that receives status strings so
-    the caller (Qt worker) can route them into the UI instead of stdout.
-
-    `prev_*` maps preserve class indices across retrains so a growing label
-    set never reshuffles the head weights.  Samples whose family is
-    'Unknown_Family' are excluded from the family loss — the head still has
-    a slot for that class, but it's never trained to predict it.
-
-    NOTE: model.update_heads() must *grow* the existing Linear layers in
-    place (preserving weights for already-known indices) rather than
-    rebuilding them.  See model.py for the corresponding patch.
-    """
-    sp_to_idx, gn_to_idx, fa_to_idx = build_label_maps(
-        OUTPUT_CROP_DIR,
-        resolver,
-        prev_sp=prev_sp,
-        prev_gn=prev_gn,
-        prev_fa=prev_fa,
-    )
-
-    # Refuse to proceed if anything vanished from the historical maps.
-    _assert_no_class_shrink(prev_sp or {}, sp_to_idx, "species")
-    _assert_no_class_shrink(prev_gn or {}, gn_to_idx, "genus")
-    _assert_no_class_shrink(prev_fa or {}, fa_to_idx, "family")
-
-    n_sp, n_gn, n_fa = len(sp_to_idx), len(gn_to_idx), len(fa_to_idx)
-
-    if min(n_sp, n_gn, n_fa) < 2:
-        log(
-            f"⏸ Skipping retrain — need ≥2 classes at every level "
-            f"(sp={n_sp}, gn={n_gn}, fa={n_fa})."
-        )
-        return None, None, None
-
-    ds = FishCropDataset(
-        OUTPUT_CROP_DIR, resolver, sp_to_idx, gn_to_idx, fa_to_idx, TRAIN_TRANSFORM
-    )
-    if len(ds) < 4:
-        log(f"⏸ Skipping retrain — only {len(ds)} crops on disk.")
-        return None, None, None
-
-    ignore_family_idx = fa_to_idx.get("Unknown_Family")
-
-    model.update_heads(n_sp, n_gn, n_fa)
-    model.to(DEVICE)
-    model.train()
-
-    loader = DataLoader(
-        ds,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=2 if os.name != "nt" else 0,
-        pin_memory=(DEVICE.type == "cuda"),
-    )
-
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=LR
-    )
-
-    use_amp = DEVICE.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
-    w_sp = compute_class_weights([s for _, s, _, _ in ds.samples], n_sp)
-    w_gn = compute_class_weights([g for _, _, g, _ in ds.samples], n_gn)
-    w_fa = compute_class_weights([f for _, _, _, f in ds.samples], n_fa)
-
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for imgs, y_sp, y_gn, y_fa in loader:
-            imgs = imgs.to(DEVICE, non_blocking=True)
-            y_sp = y_sp.to(DEVICE)
-            y_gn = y_gn.to(DEVICE)
-            y_fa = y_fa.to(DEVICE)
-
-            optimizer.zero_grad()
-            with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
-                logits_sp, logits_gn, logits_fa = model(imgs)
-                loss_sp = F.cross_entropy(logits_sp, y_sp, weight=w_sp)
-                loss_gn = F.cross_entropy(logits_gn, y_gn, weight=w_gn)
-                if ignore_family_idx is not None:
-                    mask = y_fa != ignore_family_idx
-                    if mask.any():
-                        loss_fa = F.cross_entropy(
-                            logits_fa[mask], y_fa[mask], weight=w_fa
-                        )
-                    else:
-                        loss_fa = logits_fa.sum() * 0.0
-                else:
-                    loss_fa = F.cross_entropy(logits_fa, y_fa, weight=w_fa)
-                loss = loss_sp + LAMBDA_GENUS * loss_gn + LAMBDA_FAMILY * loss_fa
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            total_loss += loss.item() * imgs.size(0)
-
-        avg = total_loss / max(len(ds), 1)
-        log(f"epoch {epoch + 1}/{epochs} | loss {avg:.4f}")
-
-    return sp_to_idx, gn_to_idx, fa_to_idx
-
-
-# ==========================================
-# 4a. Durable, atomic checkpoint + label-map persistence
-# ==========================================
-def _atomic_torch_save(obj, path):
-    """Write `obj` to `path` atomically: tmp file, fsync, then os.replace."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = f"{path}.tmp"
-    torch.save(obj, tmp)
-    # fsync so a power loss between replace and flush can't truncate the file
-    with open(tmp, "rb") as fh:
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-
-
-def _atomic_json_save(obj, path):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, indent=2)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-
-
-def _rotate_backups(timestamp):
-    """
-    Snapshot the current live checkpoint + label-map into backups/ under a
-    shared timestamp, then prune to KEEP_BACKUPS generations.
-    """
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    for src, suffix in (
-        (MULTIHEAD_CHECKPOINT, "pth"),
-        (LABEL_MAP_PATH, "labelmaps.json"),
-    ):
-        if os.path.exists(src):
-            dst = os.path.join(BACKUP_DIR, f"{timestamp}.{suffix}")
-            shutil.copy2(src, dst)
-
-    generations = sorted({f.split(".", 1)[0] for f in os.listdir(BACKUP_DIR)})
-    for old in generations[:-KEEP_BACKUPS]:
-        for suffix in ("pth", "labelmaps.json"):
-            p = os.path.join(BACKUP_DIR, f"{old}.{suffix}")
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-
-
-def save_label_maps(sp_to_idx, gn_to_idx, fa_to_idx):
-    """Persist the label maps independent of the .pth, so a checkpoint
-    without sp_to_idx (e.g. one produced by train.py) can still be
-    reconstructed into a full historical map."""
-    _atomic_json_save(
-        {
-            "sp_to_idx": sp_to_idx,
-            "gn_to_idx": gn_to_idx,
-            "fa_to_idx": fa_to_idx,
-        },
-        LABEL_MAP_PATH,
-    )
-
-
-def load_label_maps():
-    """Returns ({}, {}, {}) on any failure — missing file, corrupt JSON, etc."""
-    if not os.path.exists(LABEL_MAP_PATH):
-        return {}, {}, {}
-    try:
-        with open(LABEL_MAP_PATH, encoding="utf-8") as fh:
-            d = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}, {}, {}
-    return (
-        d.get("sp_to_idx", {}) or {},
-        d.get("gn_to_idx", {}) or {},
-        d.get("fa_to_idx", {}) or {},
-    )
-
-
-def save_checkpoint(model, sp_to_idx, gn_to_idx, fa_to_idx):
-    """
-    Rotate backups, then atomically write the label-map sidecar and the
-    checkpoint itself.  Order matters: the sidecar is written first, so if
-    the process dies between the two writes we still have a consistent
-    map that can repair the (older) .pth on next load.
-    """
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    _rotate_backups(timestamp)
-
-    save_label_maps(sp_to_idx, gn_to_idx, fa_to_idx)
-
-    _atomic_torch_save(
-        {
-            "model_state": model.state_dict(),
-            "sp_to_idx": sp_to_idx,
-            "gn_to_idx": gn_to_idx,
-            "fa_to_idx": fa_to_idx,
-            "num_species": model.num_species,
-            "num_genera": model.num_genera,
-            "num_families": model.num_families,
-        },
-        MULTIHEAD_CHECKPOINT,
-    )
-    print(f" 💾 Checkpoint saved to {MULTIHEAD_CHECKPOINT} (backup: {timestamp})")
-
-
-# ==========================================
-# 4b. Robust checkpoint loading
+# 3. Robust checkpoint loading
 # ==========================================
 def _infer_head_sizes_from_state_dict(state_dict):
     """
@@ -684,6 +332,22 @@ def _merge_label_maps(primary, sidecar):
     for k, v in (primary or {}).items():
         out.setdefault(k, v)
     return out
+
+
+def load_label_maps():
+    """Returns ({}, {}, {}) on any failure — missing file, corrupt JSON, etc."""
+    if not os.path.exists(LABEL_MAP_PATH):
+        return {}, {}, {}
+    try:
+        with open(LABEL_MAP_PATH, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}, {}, {}
+    return (
+        d.get("sp_to_idx", {}) or {},
+        d.get("gn_to_idx", {}) or {},
+        d.get("fa_to_idx", {}) or {},
+    )
 
 
 def build_or_load_model(backbone_path=None):
@@ -787,44 +451,7 @@ def predict(model, img_tensor, sp_inv, gn_inv, fa_inv):
 
 
 # ==========================================
-# 5. Qt background worker for retraining
-# ==========================================
-class RetrainWorker(QThread):
-    """
-    Runs retrain() off the Qt main thread.  While this worker is alive, do
-    NOT call predict()/model(...) from the main thread — the worker mutates
-    the same module in place.
-    """
-
-    progress = Signal(str)
-    finished_with_result = Signal(object, object, object)
-
-    def __init__(self, model, resolver, prev_sp=None, prev_gn=None, prev_fa=None):
-        super().__init__()
-        self.model = model
-        self.resolver = resolver
-        self.prev_sp = prev_sp or {}
-        self.prev_gn = prev_gn or {}
-        self.prev_fa = prev_fa or {}
-
-    def run(self):
-        try:
-            result = retrain(
-                self.model,
-                self.resolver,
-                log=self.progress.emit,
-                prev_sp=self.prev_sp,
-                prev_gn=self.prev_gn,
-                prev_fa=self.prev_fa,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.progress.emit(f"❌ Retrain failed: {exc}")
-            result = (None, None, None)
-        self.finished_with_result.emit(*result)
-
-
-# ==========================================
-# 6. Zoomable / pannable image view
+# 4. Zoomable / pannable image view
 # ==========================================
 class ZoomableImageView(QGraphicsView):
     """
@@ -928,7 +555,7 @@ class ZoomableImageView(QGraphicsView):
 
 
 # ==========================================
-# 7. Qt main window
+# 5. Qt main window
 # ==========================================
 class LabelerWindow(QMainWindow):
     def __init__(
@@ -967,7 +594,6 @@ class LabelerWindow(QMainWindow):
         self.current_model_family = None
 
         self._current_pixmap = None
-        self.retrain_worker = None
         self._closing = False
 
         # frame-nav state inside the current track
@@ -1298,9 +924,8 @@ class LabelerWindow(QMainWindow):
         remove every crop for this true_id (used when a true_id is retired
         by a merge and its crops become orphaned).
 
-        Afterwards, any species folder left empty is removed so the next
-        retrain doesn't allocate a class slot for a name we no longer have
-        any examples of.
+        Afterwards, any species folder left empty is removed so downstream
+        training doesn't see a class with no examples.
         """
         root = Path(OUTPUT_CROP_DIR)
         if not root.exists():
@@ -1346,7 +971,7 @@ class LabelerWindow(QMainWindow):
         self.split_btn.setEnabled(enabled)
 
     def _on_submit(self):
-        if self._closing or (self.retrain_worker and self.retrain_worker.isRunning()):
+        if self._closing:
             return
         if self.current_idx < 0 or self.current_row is None:
             return
@@ -1461,50 +1086,10 @@ class LabelerWindow(QMainWindow):
         msg += f" Actions: {self.action_counter}"
         self.statusBar().showMessage(msg)
 
-        if self.action_counter % RETRAIN_INTERVAL == 0:
-            self._start_retrain()
-        else:
-            self._advance()
-
-    # ---------- retraining ----------
-    def _start_retrain(self):
-        self._set_input_enabled(False)
-        self.statusBar().showMessage(
-            f"🔄 Milestone ({self.action_counter} actions). Retraining…"
-        )
+        # Flush the CSV to disk at every milestone so a crash can't lose
+        # more than a handful of labels.
         self.df.to_csv(self.out_csv_path, index=False)
 
-        self.retrain_worker = RetrainWorker(
-            self.model,
-            self.resolver,
-            prev_sp=self.sp_to_idx,
-            prev_gn=self.gn_to_idx,
-            prev_fa=self.fa_to_idx,
-        )
-        self.retrain_worker.progress.connect(self._on_retrain_progress)
-        self.retrain_worker.finished_with_result.connect(self._on_retrain_done)
-        self.retrain_worker.start()
-
-    def _on_retrain_progress(self, msg: str):
-        self.statusBar().showMessage(msg)
-
-    def _on_retrain_done(self, sp_to_idx, gn_to_idx, fa_to_idx):
-        if sp_to_idx is not None:
-            self.sp_to_idx = sp_to_idx
-            self.gn_to_idx = gn_to_idx
-            self.fa_to_idx = fa_to_idx
-            self.sp_inv = {i: s for s, i in sp_to_idx.items()}
-            self.gn_inv = {i: g for g, i in gn_to_idx.items()}
-            self.fa_inv = {i: f for f, i in fa_to_idx.items()}
-            self.is_trained = True
-            save_checkpoint(self.model, sp_to_idx, gn_to_idx, fa_to_idx)
-            self.statusBar().showMessage("✅ Retrain complete. Resuming…")
-        else:
-            self.statusBar().showMessage("⏸ Retrain skipped (not enough data).")
-
-        self.df.to_csv(self.out_csv_path, index=False)
-        self.retrain_worker = None
-        self._set_input_enabled(True)
         self._advance()
 
     # ---------- shutdown ----------
@@ -1512,35 +1097,9 @@ class LabelerWindow(QMainWindow):
         if self._closing:
             event.accept()
             return
-
-        if self.action_counter == 0:
-            self.df.to_csv(self.out_csv_path, index=False)
-            event.accept()
-            return
-
-        event.ignore()
         self._closing = True
         self._set_input_enabled(False)
-        self.df.to_csv(self.out_csv_path, index=False)
 
-        self.statusBar().showMessage("🏁 Session ending — running final retrain…")
-        self.retrain_worker = RetrainWorker(
-            self.model,
-            self.resolver,
-            prev_sp=self.sp_to_idx,
-            prev_gn=self.gn_to_idx,
-            prev_fa=self.fa_to_idx,
-        )
-        self.retrain_worker.progress.connect(self._on_retrain_progress)
-        self.retrain_worker.finished_with_result.connect(self._on_final_retrain_done)
-        self.retrain_worker.start()
-
-    def _on_final_retrain_done(self, sp_to_idx, gn_to_idx, fa_to_idx):
-        if sp_to_idx is not None:
-            self.sp_to_idx = sp_to_idx
-            self.gn_to_idx = gn_to_idx
-            self.fa_to_idx = fa_to_idx
-        save_checkpoint(self.model, self.sp_to_idx, self.gn_to_idx, self.fa_to_idx)
         self.df.to_csv(self.out_csv_path, index=False)
 
         # Persist any GBIF results from this session so the next run is offline.
@@ -1550,12 +1109,11 @@ class LabelerWindow(QMainWindow):
             print(f" ⚠ Could not finalize resolver cache: {exc}")
 
         print(f"🏁 Session closed. Progress saved to: {self.out_csv_path}")
-        self.retrain_worker = None
-        self.close()
+        event.accept()
 
 
 # ==========================================
-# 8. Entry point
+# 6. Entry point
 # ==========================================
 def execute_pipeline():
     args = parse_args()
@@ -1586,7 +1144,6 @@ def execute_pipeline():
     print(f"GBIF cache:         {args.gbif_cache}")
     print(f"Checkpoint:         {MULTIHEAD_CHECKPOINT}")
     print(f"Label maps:         {LABEL_MAP_PATH}")
-    print(f"Backups:            {BACKUP_DIR}")
 
     os.makedirs(OUTPUT_CROP_DIR, exist_ok=True)
 
@@ -1628,7 +1185,7 @@ def execute_pipeline():
         "  ➔ For probable ID swaps, run check_id_swaps.py against the source "
         "video first; it will split the track and backfill the swap frame."
     )
-    print("  ➔ Type 'exit' (or close the window) to retrain & save.")
+    print("  ➔ Type 'exit' (or close the window) to save and quit.")
     print("=======================================================\n")
 
     window = LabelerWindow(
