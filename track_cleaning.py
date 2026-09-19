@@ -21,9 +21,18 @@ Features:
   • Auto-suggestion from the current multi-head model with softmax
     confidences shown in the UI. Press Enter on an empty field to accept,
     type a name to override.
+  • Corrections overwrite cleanly: typing a species for an already-labeled
+    True ID (or merging two identities together) rewrites every row in
+    that identity group and removes the stale crop(s) filed under the
+    previous species, so a fixed mistake does not linger in the training
+    corpus.  The species entry pre-fills with the current label so a fix
+    is an edit rather than a retype.
   • Zoomable, pannable viewer (scroll wheel to zoom under cursor, drag to
     pan, double-click to toggle fit ↔ 100%, Ctrl+0 / Ctrl+1 / Ctrl+= /
     Ctrl+- shortcuts) for resolving ambiguous fish.
+  • Free-scroll frame navigation (Prev/Next and Alt+←/→) walks every
+    detection in the dataset, not just the current Track ID, so you can
+    audit or relabel any row without hunting for its track.
   • Crops of every confirmed label are written to disk under
     ./output/labeled_fish_crops/<species>/ for use as future training data.
   • Every RETRAIN_INTERVAL confirmations, and once more at session end,
@@ -965,6 +974,14 @@ class LabelerWindow(QMainWindow):
         self._track_row_indices = []
         self._track_pos = 0
 
+        # free-scroll state across every detection, sorted by frame
+        self._all_row_indices = (
+            self.df.assign(_f=pd.to_numeric(self.df["frame"], errors="coerce"))
+            .sort_values(["_f", "id"], kind="stable")
+            .index.tolist()
+        )
+        self._global_pos = 0
+
         self._build_ui()
         QTimer.singleShot(0, self._advance)
 
@@ -1028,10 +1045,18 @@ class LabelerWindow(QMainWindow):
         identity_row.addStretch(1)
 
         self.prev_btn = QPushButton("◀ Prev frame")
+        self.prev_btn.setToolTip(
+            "Previous detection in the whole dataset (Alt+Left). "
+            "Skips to the prior frame if the current track has no match."
+        )
         self.prev_btn.clicked.connect(lambda: self._nav_frame(-1))
         identity_row.addWidget(self.prev_btn)
 
         self.next_btn = QPushButton("Next frame ▶")
+        self.next_btn.setToolTip(
+            "Next detection in the whole dataset (Alt+Right). "
+            "Skips to the next frame if the current track has no match."
+        )
         self.next_btn.clicked.connect(lambda: self._nav_frame(+1))
         identity_row.addWidget(self.next_btn)
 
@@ -1101,7 +1126,7 @@ class LabelerWindow(QMainWindow):
         self.current_row = row
         self.current_cropped = cropped
 
-        # Frame navigation state across the whole track.
+        # Per-track navigation state (kept for the "Track X/Y" indicator).
         track_idxs = self.df.index[self.df["id"] == row["id"]].tolist()
         track_idxs.sort(key=lambda i: self.df.at[i, "frame"])
         self._track_row_indices = track_idxs
@@ -1109,6 +1134,12 @@ class LabelerWindow(QMainWindow):
             self._track_pos = track_idxs.index(idx)
         except ValueError:
             self._track_pos = 0
+
+        # Global navigation state.
+        try:
+            self._global_pos = self._all_row_indices.index(idx)
+        except ValueError:
+            self._global_pos = 0
 
         suggestion, source_type = None, ""
         model_genus = model_family = None
@@ -1148,17 +1179,44 @@ class LabelerWindow(QMainWindow):
         self.frame_label.setText(
             f"Index: {idx} | Frame: {frame_src} | "
             f"Track ID: {int(row['id'])} | True ID: {row['true_id']} | "
-            f"Frame {self._track_pos + 1}/{len(track_idxs)}"
+            f"Track {self._track_pos + 1}/{len(track_idxs)} | "
+            f"All {self._global_pos + 1}/{len(self._all_row_indices)}"
         )
-        if suggestion:
+
+        # Surface any label already attached to this row or its True ID
+        # group, so free-scrolling shows *what's been decided* rather than
+        # only the model's guess.
+        existing_label = row["assigned_species"] if "assigned_species" in row else None
+        if pd.isna(existing_label) and "true_id" in row:
+            grp = self.df[
+                (self.df["true_id"] == row["true_id"])
+                & (self.df["assigned_species"].notna())
+            ]
+            if len(grp):
+                existing_label = grp["assigned_species"].iloc[0]
+
+        if pd.notna(existing_label):
+            rec_txt = f"Current label: {existing_label}"
+            if suggestion and canonical_species(existing_label) != suggestion:
+                rec_txt += f"  |  model suggests {suggestion}  |  {source_type}"
+            self.reco_label.setText(rec_txt)
+        elif suggestion:
             self.reco_label.setText(f"Recommendation: {suggestion}  |  {source_type}")
         else:
             self.reco_label.setText("Recommendation: (model not yet trained)")
 
         self.true_id_entry.setText(str(row["true_id"]))
+
         # Only reset the species entry when we move to a different fish.
+        # If we already know a label for this identity, pre-fill it so a
+        # correction is an edit to a visible value rather than a retype.
         if prev_id != row["id"]:
-            self.entry.clear()
+            if pd.notna(existing_label):
+                self.entry.setText(str(existing_label))
+                self.entry.selectAll()
+            else:
+                self.entry.clear()
+
         self.entry.setFocus()
         return True
 
@@ -1207,16 +1265,77 @@ class LabelerWindow(QMainWindow):
         self._show_index(self.current_idx)
 
     def _nav_frame(self, delta):
-        if not self._track_row_indices:
+        """Step through *all* detections in the dataset, sorted by frame.
+
+        Frame numbers with no detection (or unreadable images) are skipped
+        silently so a single Prev/Next press always lands on something
+        viewable, regardless of which track you started from.
+        """
+        if self.current_idx < 0 or not self._all_row_indices:
             return
-        n = len(self._track_row_indices)
+        try:
+            pos = self._all_row_indices.index(self.current_idx)
+        except ValueError:
+            pos = 0
         step = 1 if delta > 0 else -1
-        pos = self._track_pos + step
-        while 0 <= pos < n:
-            if self._show_index(self._track_row_indices[pos]):
+        pos += step
+        while 0 <= pos < len(self._all_row_indices):
+            if self._show_index(self._all_row_indices[pos]):
                 return
             pos += step
-        self.statusBar().showMessage("No more frames for this track.")
+        self.statusBar().showMessage("No more frames in either direction.")
+
+    # ---------- on-disk crop maintenance ----------
+    def _purge_crops_for_true_id(self, true_id, keep_species=None):
+        """Delete on-disk crops filed for `true_id` under the *wrong* species.
+
+        Crop filenames embed both the row index and the true_id, e.g.
+        `crop_idx42_true5.jpg`, so a true_id-glob is a precise way to find
+        every crop belonging to that identity group regardless of which
+        species folder it was written under.
+
+        `keep_species` = folder name that should survive; pass None to
+        remove every crop for this true_id (used when a true_id is retired
+        by a merge and its crops become orphaned).
+
+        Afterwards, any species folder left empty is removed so the next
+        retrain doesn't allocate a class slot for a name we no longer have
+        any examples of.
+        """
+        root = Path(OUTPUT_CROP_DIR)
+        if not root.exists():
+            return 0
+
+        suffix = f"_true{true_id}.jpg"
+        keep_resolved = (root / keep_species).resolve() if keep_species else None
+
+        removed = 0
+        for species_dir in root.iterdir():
+            if not species_dir.is_dir():
+                continue
+            try:
+                if keep_resolved is not None and species_dir.resolve() == keep_resolved:
+                    continue
+            except OSError:
+                continue
+            for crop in species_dir.glob(f"crop_idx*{suffix}"):
+                try:
+                    crop.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+
+        # Prune any folders we just emptied.
+        for species_dir in list(root.iterdir()):
+            if not species_dir.is_dir():
+                continue
+            try:
+                if not any(species_dir.iterdir()):
+                    species_dir.rmdir()
+            except OSError:
+                pass
+
+        return removed
 
     # ---------- input handling ----------
     def _set_input_enabled(self, enabled: bool):
@@ -1237,46 +1356,93 @@ class LabelerWindow(QMainWindow):
             self.close()
             return
 
-        if text == "" and self.current_suggestion:
-            final_species = canonical_species(self.current_suggestion)
-        elif text != "":
-            final_species = canonical_species(text)
-        else:
-            self.reco_label.setText(
-                "❌ Input required — no valid recommendation exists yet."
-            )
-            return
-
         row = self.current_row
+        current_id = row["id"]
+        old_true_id = row["true_id"]
+
+        # ---- 1. Decide which True ID we're writing to -------------------
+        typed = self.true_id_entry.text().strip()
+        new_true_id = self._parse_true_id(typed) if typed else None
+        if new_true_id is not None and new_true_id != old_true_id:
+            effective_true_id = new_true_id
+        else:
+            effective_true_id = old_true_id
+        is_merge = new_true_id is not None and new_true_id != old_true_id
+
+        # ---- 2. Look for an already-assigned species on this identity ---
+        existing = self.df[
+            (self.df["true_id"] == effective_true_id)
+            & (self.df["assigned_species"].notna())
+        ]
+        existing_species = (
+            existing["assigned_species"].iloc[0] if len(existing) else None
+        )
+
+        # ---- 3. Resolve the species ------------------------------------
+        if text == "":
+            if existing_species is not None:
+                final_species = canonical_species(existing_species)
+                self.statusBar().showMessage(
+                    f"↩ Reused existing label '{final_species}' for "
+                    f"true_id {effective_true_id}."
+                )
+            elif self.current_suggestion:
+                final_species = canonical_species(self.current_suggestion)
+            else:
+                self.reco_label.setText(
+                    "❌ Input required — no prior label or recommendation for this ID."
+                )
+                return
+        else:
+            final_species = canonical_species(text)
+
         final_species, final_genus, final_family = self.resolver.resolve(final_species)
         if final_family == "Unknown_Family" and self.current_model_family:
             final_family = self.current_model_family
         if final_genus == "Unknown" and self.current_model_genus:
             final_genus = self.current_model_genus
 
-        # --- Resolve true_id: merge/rename the current segment if changed ---
-        current_id = row["id"]
-        old_true_id = row["true_id"]
-        typed = self.true_id_entry.text().strip()
-        new_true_id = self._parse_true_id(typed) if typed else None
-
-        if new_true_id is not None and new_true_id != old_true_id:
+        # ---- 4. If the True ID changed, apply the segment merge ---------
+        if is_merge:
             seg_mask = (self.df["id"] == current_id) & (
                 self.df["true_id"] == old_true_id
             )
             self.df.loc[seg_mask, "true_id"] = new_true_id
-            effective_true_id = new_true_id
-        else:
-            effective_true_id = old_true_id
 
-        # --- Propagate the label to the whole identity group ---
-        group_mask = (self.df["true_id"] == effective_true_id) & (
-            self.df["assigned_species"].isna()
-        )
+        # ---- 5. Propagate / overwrite ----------------------------------
+        # A typed species is an explicit instruction: overwrite every row
+        # in the identity group, so correcting an earlier mistake actually
+        # takes effect instead of silently no-op'ing on already-labeled
+        # rows.  A merge is treated the same way — otherwise the joined
+        # group would end up with a mixture of the two old labels.
+        #
+        # A blank submission that wasn't a merge only fills NaN rows, so
+        # accepting the model suggestion never tramples an existing label.
+        overwrite = bool(text) or is_merge
+        if overwrite:
+            group_mask = self.df["true_id"] == effective_true_id
+        else:
+            group_mask = (self.df["true_id"] == effective_true_id) & (
+                self.df["assigned_species"].isna()
+            )
         n_matched = int(group_mask.sum())
         self.df.loc[group_mask, "assigned_species"] = final_species
         self.df.loc[group_mask, "assigned_genus"] = final_genus
         self.df.loc[group_mask, "assigned_family"] = final_family
+
+        # ---- 6. Reconcile the on-disk crop corpus ----------------------
+        # If we just merged, the old true_id no longer exists in the
+        # DataFrame; any crop filed under it is orphaned.
+        n_purged = 0
+        if is_merge:
+            n_purged += self._purge_crops_for_true_id(old_true_id)
+
+        # Remove any crops for this true_id sitting under a *different*
+        # species folder — those are the stale artefacts of the earlier,
+        # wrong label and would otherwise keep poisoning the training set.
+        n_purged += self._purge_crops_for_true_id(
+            effective_true_id, keep_species=final_species
+        )
 
         species_dir = os.path.join(OUTPUT_CROP_DIR, final_species)
         os.makedirs(species_dir, exist_ok=True)
@@ -1287,10 +1453,13 @@ class LabelerWindow(QMainWindow):
         cv2.imwrite(crop_path, self.current_cropped)
 
         self.action_counter += 1
-        self.statusBar().showMessage(
-            f"💾 Applied labels to {n_matched} frames for true_id "
-            f"{effective_true_id}. Actions: {self.action_counter}"
+        msg = (
+            f"💾 Applied labels to {n_matched} frames for true_id {effective_true_id}."
         )
+        if n_purged:
+            msg += f" Purged {n_purged} stale crop(s)."
+        msg += f" Actions: {self.action_counter}"
+        self.statusBar().showMessage(msg)
 
         if self.action_counter % RETRAIN_INTERVAL == 0:
             self._start_retrain()
