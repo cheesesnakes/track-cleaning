@@ -261,10 +261,10 @@ def detect_track_discontinuities(df, *, velocity_window=5, max_pairs=500):
             gap_score = float(np.log1p(f_gap)) / 5.0
 
             score = (
-                1.0 * jump_score
-                + 15.0 * angle_score
-                + 8.0 * area_score
-                + 4.0 * speed_score
+                1 * jump_score
+                + 20.0 * angle_score
+                + 0.25 * area_score
+                + 1.0 * speed_score
                 + 5.0 * gap_score
             )
 
