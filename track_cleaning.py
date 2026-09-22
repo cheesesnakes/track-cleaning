@@ -20,6 +20,8 @@ Features:
   • Auto-suggestion from the loaded multi-head model with softmax
     confidences shown in the UI. Press Enter on an empty field to accept,
     type a name to override.
+  • Top-3 species suggestions, each annotated with its resolved family,
+    plus the family head's top-3. Family lookups are memoized per session.
   • Corrections overwrite cleanly: typing a species for an already-labeled
     True ID (or merging two identities together) rewrites every row in
     that identity group and removes the stale crop(s) filed under the
@@ -430,23 +432,40 @@ def build_or_load_model(backbone_path=None):
     return model, sidecar_sp, sidecar_gn, sidecar_fa, False
 
 
-def predict(model, img_tensor, sp_inv, gn_inv, fa_inv):
+def predict(model, img_tensor, sp_inv, gn_inv, fa_inv, topk=3):
+    """Return top-`topk` species, genus, and family predictions with confidences.
+
+    Returns
+    -------
+    sp_list : list[(species_name, confidence)]   # length <= topk
+    gn_list : list[(genus_name,   confidence)]   # length <= topk
+    fa_list : list[(family_name,  confidence)]   # length <= topk
+    """
     model.eval()
     with torch.no_grad():
         sp, gn, fa = model(img_tensor.to(DEVICE))
         sp_p = F.softmax(sp, dim=1)
         gn_p = F.softmax(gn, dim=1)
         fa_p = F.softmax(fa, dim=1)
-        sp_conf, sp_i = sp_p.max(dim=1)
-        gn_conf, gn_i = gn_p.max(dim=1)
-        fa_conf, fa_i = fa_p.max(dim=1)
+
+        k_sp = min(topk, sp_p.size(1))
+        k_gn = min(topk, gn_p.size(1))
+        k_fa = min(topk, fa_p.size(1))
+
+        sp_conf, sp_i = sp_p.topk(k_sp, dim=1)
+        gn_conf, gn_i = gn_p.topk(k_gn, dim=1)
+        fa_conf, fa_i = fa_p.topk(k_fa, dim=1)
+
+    def _pack(conf, idx, inv):
+        return [
+            (inv.get(idx[0, k].item(), "?"), float(conf[0, k].item()))
+            for k in range(idx.size(1))
+        ]
+
     return (
-        sp_inv.get(sp_i.item(), "?"),
-        gn_inv.get(gn_i.item(), "?"),
-        fa_inv.get(fa_i.item(), "?"),
-        sp_conf.item(),
-        gn_conf.item(),
-        fa_conf.item(),
+        _pack(sp_conf, sp_i, sp_inv),
+        _pack(gn_conf, gn_i, gn_inv),
+        _pack(fa_conf, fa_i, fa_inv),
     )
 
 
@@ -596,6 +615,10 @@ class LabelerWindow(QMainWindow):
         self._current_pixmap = None
         self._closing = False
 
+        # Session-level memoization for species → family resolution, so the
+        # top-3 display doesn't trigger repeated GBIF / resolver lookups.
+        self._species_family_cache = {}
+
         # frame-nav state inside the current track
         self._track_row_indices = []
         self._track_pos = 0
@@ -629,6 +652,7 @@ class LabelerWindow(QMainWindow):
 
         self.reco_label = QLabel("")
         self.reco_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.reco_label.setWordWrap(True)
         layout.addWidget(self.reco_label)
 
         # Species entry.
@@ -715,6 +739,18 @@ class LabelerWindow(QMainWindow):
         self._current_pixmap = QPixmap.fromImage(qimg)
         self.image_view.set_pixmap(self._current_pixmap)
 
+    # ---------- taxonomy helper ----------
+    def _family_for(self, species):
+        """Resolve family for a species name, memoized for the session."""
+        if species in self._species_family_cache:
+            return self._species_family_cache[species]
+        try:
+            _, _, fam = self.resolver.resolve(species)
+        except Exception:  # noqa: BLE001
+            fam = "Unknown"
+        self._species_family_cache[species] = fam
+        return fam
+
     # ---------- navigation ----------
     def _load_frame_bgr(self, frame_num):
         """Return the full BGR frame image for `frame_num`, or (None, None)."""
@@ -769,18 +805,31 @@ class LabelerWindow(QMainWindow):
 
         suggestion, source_type = None, ""
         model_genus = model_family = None
+        sp_suggestions = []  # [(species, conf, family), ...]
         if self.is_trained:
             rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
             pil = Image.fromarray(rgb)
             tensor = EVAL_TRANSFORM(pil).unsqueeze(0)
-            sp, gn, fa, c_sp, c_gn, c_fa = predict(
-                self.model, tensor, self.sp_inv, self.gn_inv, self.fa_inv
+            sp_list, gn_list, fa_list = predict(
+                self.model, tensor, self.sp_inv, self.gn_inv, self.fa_inv, topk=3
             )
-            suggestion = canonical_species(sp)
-            model_genus = gn
-            model_family = fa
+
+            for sp_name, c_sp in sp_list:
+                sp_canon = canonical_species(sp_name)
+                sp_suggestions.append((sp_canon, c_sp, self._family_for(sp_canon)))
+
+            suggestion = sp_suggestions[0][0] if sp_suggestions else None
+            model_genus = gn_list[0][0] if gn_list else None
+            model_family = fa_list[0][0] if fa_list else None
+
+            sp_txt = "  |  ".join(
+                f"{s} ({c * 100:.0f}% · {fam})" for s, c, fam in sp_suggestions
+            )
+            gn_txt = f"{gn_list[0][0]} ({gn_list[0][1] * 100:.0f}%)" if gn_list else "?"
+            fa_txt = "  |  ".join(f"{f} ({c * 100:.0f}%)" for f, c in fa_list)
             source_type = (
-                f"🤖 sp={c_sp * 100:.0f}% gn={c_gn * 100:.0f}% fa={c_fa * 100:.0f}%"
+                f"🤖 Species top-3: {sp_txt}\n"
+                f"    Genus: {gn_txt}   |   Family top-3: {fa_txt}"
             )
 
         self.current_suggestion = suggestion
@@ -824,10 +873,10 @@ class LabelerWindow(QMainWindow):
         if pd.notna(existing_label):
             rec_txt = f"Current label: {existing_label}"
             if suggestion and canonical_species(existing_label) != suggestion:
-                rec_txt += f"  |  model suggests {suggestion}  |  {source_type}"
+                rec_txt += f"\n  model top-1: {suggestion}\n{source_type}"
             self.reco_label.setText(rec_txt)
         elif suggestion:
-            self.reco_label.setText(f"Recommendation: {suggestion}  |  {source_type}")
+            self.reco_label.setText(f"Recommendation:\n{source_type}")
         else:
             self.reco_label.setText("Recommendation: (model not yet trained)")
 
