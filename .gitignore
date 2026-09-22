@@ -1,7 +1,8 @@
 annotated_frames/
 images/
 output/
-models/
+backup/
+fish_detector*
 __pycache__
 videos
 *.csv
